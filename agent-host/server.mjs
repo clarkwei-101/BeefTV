@@ -313,6 +313,17 @@ const server = http.createServer(async (req, res) => {
           turnId, userText, selectedNodeIds: selected, references, createdAt: new Date().toISOString(),
         });
         res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        // If the RPC client hangs up mid-turn, abort the in-flight LLM run
+        // so we don't keep billing the GPU and holding the session busy
+        // for a caller that already gave up. ``res.writableEnded`` is the
+        // canonical signal — using ``res.closed`` is racy on some Node
+        // versions where it lags the underlying socket close.
+        const onClientClose = () => {
+          if (entry.generation.aborted) return;
+          entry.generation.aborted = true;
+          entry.session.abort().catch(() => {});
+        };
+        res.on('close', onClientClose);
         const before = entry.log.length;
         const started = Date.now();
         let firstTokenMs = null;

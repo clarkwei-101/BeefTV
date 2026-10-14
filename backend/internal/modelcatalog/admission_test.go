@@ -437,3 +437,130 @@ func assertModelError(t *testing.T, err error, code ModelErrorCode, contains str
 		t.Fatalf("error = %q, want substring %q", err.Error(), contains)
 	}
 }
+
+func TestResolveLocalModelSelection(t *testing.T) {
+	tests := []struct {
+		name           string
+		logicalModelID string
+		taskType       string
+		want           bool
+		wantBaseURL    string
+		wantModel      string
+	}{
+		{
+			name:           "dgx flux image",
+			logicalModelID: "dgx-flux-local::flux-schnell",
+			taskType:       "canvas_image",
+			want:           true,
+			wantBaseURL:    "http://localhost:8198",
+			wantModel:      "flux-schnell",
+		},
+		{
+			name:           "minimax video",
+			logicalModelID: "minimax-h3-local::minimax-h3",
+			taskType:       "canvas_video",
+			want:           true,
+			wantBaseURL:    "http://localhost:8198",
+			wantModel:      "minimax-h3",
+		},
+		{
+			name:           "mac piper audio",
+			logicalModelID: "mac-piper-local::piper",
+			taskType:       "canvas_audio",
+			want:           true,
+			wantBaseURL:    "http://localhost:8198",
+			wantModel:      "piper",
+		},
+		{
+			name:           "mac ollama text",
+			logicalModelID: "mac-ollama-local::qwen3:8b",
+			taskType:       "canvas_text",
+			want:           true,
+			wantBaseURL:    "http://localhost:8198",
+			wantModel:      "qwen3:8b",
+		},
+		{
+			name:           "dgx deepseek text",
+			logicalModelID: "dgx-deepseek-local::deepseek-v4-flash",
+			taskType:       "canvas_text",
+			want:           true,
+			wantBaseURL:    "http://localhost:8198",
+			wantModel:      "deepseek-v4-flash",
+		},
+		{
+			name:           "no separator is not local",
+			logicalModelID: "hosted-gpt-image",
+			taskType:       "canvas_image",
+			want:           false,
+		},
+		{
+			name:           "empty channel id is not local",
+			logicalModelID: "::flux-schnell",
+			taskType:       "canvas_image",
+			want:           false,
+		},
+		{
+			name:           "empty model id is not local",
+			logicalModelID: "dgx-flux-local::",
+			taskType:       "canvas_image",
+			want:           false,
+		},
+		{
+			name:           "unknown channel is not local",
+			logicalModelID: "unknown-channel::model",
+			taskType:       "canvas_image",
+			want:           false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := map[string]any{"config": map[string]any{}}
+			result, ok := resolveLocalModelSelection(test.logicalModelID, input, test.taskType, "")
+			if ok != test.want {
+				t.Fatalf("resolveLocalModelSelection() ok = %v, want %v", ok, test.want)
+			}
+			if !test.want {
+				return
+			}
+			cfg, ok := result["config"].(map[string]any)
+			if !ok {
+				t.Fatalf("result.config missing or wrong type: %T", result["config"])
+			}
+			if baseURL, _ := cfg["baseUrl"].(string); baseURL != test.wantBaseURL {
+				t.Fatalf("baseUrl = %q, want %q", baseURL, test.wantBaseURL)
+			}
+			if model, _ := cfg["model"].(string); model != test.wantModel {
+				t.Fatalf("model = %q, want %q", model, test.wantModel)
+			}
+			if apiKey, _ := cfg["apiKey"].(string); apiKey == "" {
+				t.Fatalf("apiKey is empty, expected sentinel for local proxy")
+			}
+		})
+	}
+}
+
+func TestSelectTaskModelLocalIDBypassesFrontendEnabled(t *testing.T) {
+	// Local model IDs must resolve regardless of FrontendEnabled so the desktop
+	// workspace (where FeatureFrontendModels is intentionally off) can still
+	// dispatch to the local proxy.
+	input := map[string]any{
+		"mode":   "image",
+		"config": map[string]any{},
+	}
+	result, err := SelectTaskModel(TaskSelectRequest{
+		Input:           input,
+		LogicalModelID:  "dgx-flux-local::flux-schnell",
+		Type:            "canvas_image",
+		FrontendEnabled: false,
+	}, TaskSelectLookup{})
+	if err != nil {
+		t.Fatalf("SelectTaskModel() error = %v", err)
+	}
+	cfg, ok := result.Input["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("input.config missing or wrong type: %T", result.Input["config"])
+	}
+	if baseURL, _ := cfg["baseUrl"].(string); baseURL != "http://localhost:8198" {
+		t.Fatalf("baseUrl = %q, want %q", baseURL, "http://localhost:8198")
+	}
+}

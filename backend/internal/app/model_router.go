@@ -3,11 +3,29 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"infinite-canvas/backend/internal/model"
 	"infinite-canvas/backend/internal/modelcatalog"
 )
+
+// isLocalModelLogicalID returns true when the logical model ID is in the local
+// "channelID::modelKey" form that the desktop dev script provisions. The
+// corresponding provider config is hydrated at task creation time by
+// modelcatalog.resolveLocalModelSelection, so the worker must not look the ID
+// up in the logical_models table.
+func isLocalModelLogicalID(logicalModelID string) bool {
+	trimmed := strings.TrimSpace(logicalModelID)
+	if trimmed == "" {
+		return false
+	}
+	if !strings.Contains(trimmed, "::") {
+		return false
+	}
+	parts := strings.SplitN(trimmed, "::", 2)
+	return strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
+}
 
 func (s *Service) invalidateRouteCatalog() {
 	if s == nil {
@@ -31,6 +49,14 @@ func (s *Service) createRouteAttempt(task *model.Task, routed *RoutedModel, atte
 func (s *Service) beginTaskRouteAttempt(task *model.Task) (*model.RouteAttempt, error) {
 	if task == nil {
 		return nil, nil
+	}
+	// Local model IDs ("channelID::modelKey") carry the proxy URL inside the
+	// identifier and were already rewritten to a working provider config at
+	// task admission. There is no logical_models row for them, so the route
+	// lookup below would return a "logical model missing" error. Treat the
+	// task as direct instead.
+	if isLocalModelLogicalID(task.LogicalModelID) {
+		return s.createDirectTaskAttempt(task)
 	}
 	attempts, err := s.repo.RouteAttempts(task.ID, task.RouteRun)
 	if err != nil {

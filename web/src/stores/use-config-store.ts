@@ -608,8 +608,39 @@ export function channelHasManagedBeefAPICredential(channel: Pick<ModelChannel, "
     return channel.credentialRef === MANAGED_BEEFAPI_CREDENTIAL_REF || channel.hasApiKey === true;
 }
 
-export function channelHasGenerationCredential(channel: Pick<ModelChannel, "id" | "pinned" | "credentialRef" | "hasApiKey" | "apiKey">) {
-    return channelHasManagedBeefAPICredential(channel) || Boolean(channel.apiKey?.trim());
+// Local / loopback / private-LAN base URLs (e.g. http://127.0.0.1:8198, http://192.168.x.x:8188)
+// do not require an API key — the network boundary itself is the trust boundary. The BeefTV
+// backend is local-first, so every channel the desktop dev script provisions (start.sh's
+// configure_channels) is exactly this shape; without this carve-out `isAiConfigReady` returns
+// false for every local channel and the canvas generation executor immediately redirects to
+// /settings?section=channels&continue=1, which is the "一生成就跳转" symptom.
+export function isLocalChannelBaseUrl(baseUrl: string): boolean {
+    const trimmed = baseUrl?.trim();
+    if (!trimmed) return false;
+    let host = "";
+    try {
+        host = new URL(trimmed).hostname.toLowerCase();
+    } catch {
+        return false;
+    }
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") return true;
+    if (host.startsWith("127.")) return true; // loopback range 127.0.0.0/8
+    if (host.startsWith("10.")) return true; // RFC 1918
+    if (host.startsWith("192.168.")) return true; // RFC 1918
+    const match = host.match(/^172\.(\d{1,3})\./);
+    if (match) {
+        const second = Number(match[1]);
+        if (second >= 16 && second <= 31) return true; // RFC 1918
+    }
+    if (host.endsWith(".local") || host.endsWith(".internal") || host.endsWith(".lan")) return true; // mDNS / private TLDs
+    return false;
+}
+
+export function channelHasGenerationCredential(channel: Pick<ModelChannel, "id" | "pinned" | "credentialRef" | "hasApiKey" | "apiKey" | "baseUrl">) {
+    if (channelHasManagedBeefAPICredential(channel)) return true;
+    if (Boolean(channel.apiKey?.trim())) return true;
+    if (isLocalChannelBaseUrl(channel.baseUrl)) return true;
+    return false;
 }
 
 function isAiConfigReady(config: AiConfig, model: string) {

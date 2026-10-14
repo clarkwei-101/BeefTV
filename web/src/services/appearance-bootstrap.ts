@@ -15,7 +15,6 @@ export async function resolvePublicAppearance(fetchAppearance: (signal: AbortSig
     }
 }
 
-export async function bootstrapAppearance(fetchAppearance?: (signal: AbortSignal) => Promise<PublicAppearance>) {
-    void fetchAppearance;
-    return commitPublicAppearance(DEFAULT_PUBLIC_APPEARANCE);
+export async function bootstrapAppearance(fetchAppearance: (signal: AbortSignal) => Promise<PublicAppearance> = getPublicAppearance) {
+    return commitPublicAppearance(await resolvePublicAppearance(fetchAppearance));
 }

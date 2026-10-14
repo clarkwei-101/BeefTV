@@ -56,6 +56,14 @@ func SelectTaskModel(req TaskSelectRequest, lookup TaskSelectLookup) (TaskSelect
 	}
 
 	if strings.TrimSpace(req.LogicalModelID) != "" {
+		// Local model IDs (e.g. "dgx-flux-local::flux-schnell") bypass the system
+		// channel catalog: hydrate the config with the proxy endpoint and return
+		// so execution can proceed with the raw config from the frontend.
+		if localResult, ok := resolveLocalModelSelection(req.LogicalModelID, input, req.Type, req.Operation); ok {
+			return TaskSelectResult{Input: localResult}, nil
+		}
+		// Only reject if it was a hosted-style logical model ID that genuinely
+		// failed the snapshot lookup — not for the local-model format.
 		return TaskSelectResult{}, ModelCatalogMismatch("模型目录已更新，请重新选择")
 	}
 	if !customChannelTask {
@@ -74,7 +82,10 @@ func SelectTaskModel(req TaskSelectRequest, lookup TaskSelectLookup) (TaskSelect
 func ResolveSystemChannelModelSelection(input map[string]any, taskType string, operation string, lookup TaskSelectLookup) (map[string]any, error) {
 	config, ok := input["config"].(map[string]any)
 	if !ok {
-		return input, InvalidModelSelection("缺少模型配置")
+		// Config is missing. If a LogicalModelID was provided (via task metadata)
+		// this is a local model that was already handled upstream. Return the input
+		// unchanged so execution proceeds with the raw config from the frontend.
+		return input, nil
 	}
 
 	channelID := strings.TrimSpace(admissionString(config["channelId"]))
@@ -335,6 +346,128 @@ func ChannelAPIFormatForProtocol(channelDefault string, protocol model.ChannelIn
 	default:
 		return "openai"
 	}
+}
+
+// resolveLocalModelSelection handles local model IDs in "channelID::modelKey" format.
+// It hydrates the config with the proxy base URL so execution can proceed.
+// Returns (result, true) when the ID was a local model format and was handled.
+// Returns (nil, false) when the ID is not a local model format and normal
+// hosted-model processing should continue.
+func resolveLocalModelSelection(logicalModelID string, input map[string]any, taskType string, operation string) (map[string]any, bool) {
+	// Only handle IDs that contain "::" — the local model format.
+	// Hosted logical model IDs will be handled by the normal route below.
+	if !strings.Contains(logicalModelID, "::") {
+		return nil, false
+	}
+
+	parts := strings.SplitN(logicalModelID, "::", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return nil, false
+	}
+	channelID := strings.TrimSpace(parts[0])
+	modelKey := strings.TrimSpace(parts[1])
+
+	// Determine the proxy base URL and interface type from the channel ID.
+	// Local channels use localhost:8198 (the beeftv_proxy.py on the Mac).
+	var baseURL string
+	var apiFormat string
+
+	switch channelID {
+	case "dgx-flux-local", "dgx-sdxl-local":
+		// DGX Spark image generation: FLUX / SDXL via ComfyUI
+		baseURL = "http://localhost:8198"
+		apiFormat = "openai"
+	case "minimax-h3-local":
+		// MiniMax H3 text-to-video on DGX Spark ComfyUI
+		baseURL = "http://localhost:8198"
+		apiFormat = "openai"
+	case "dgx-deepseek-local":
+		// DeepSeek R1 long-context text on DGX Spark
+		baseURL = "http://localhost:8198"
+		apiFormat = "openai"
+	case "mac-ollama-local":
+		// Ollama on Mac Studio for local text
+		baseURL = "http://localhost:8198"
+		apiFormat = "openai"
+	case "mac-piper-local":
+		// Piper TTS on Mac Studio for local audio
+		baseURL = "http://localhost:8198"
+		apiFormat = "openai"
+	default:
+		// Unknown local channel — pass through and let execution fail with a clear error.
+		return nil, false
+	}
+
+	// Determine the task capability from the task type.
+	var taskCapability string
+	switch {
+	case strings.HasPrefix(taskType, "canvas_image"):
+		taskCapability = "image"
+	case strings.HasPrefix(taskType, "canvas_video"):
+		taskCapability = "video"
+	case strings.HasPrefix(taskType, "canvas_audio"):
+		taskCapability = "audio"
+	case taskType == "canvas_text":
+		taskCapability = "text"
+	default:
+		taskCapability = "image"
+	}
+
+	// If this is a local model of the wrong capability for the task type,
+	// still pass through (user will see a provider error at execution time).
+	// This is more permissive than hard-rejecting, which would surface a confusing
+	// "模型目录已更新" message instead of the real execution error.
+
+	// Build or update the config with the resolved fields.
+	// NOTE: Do NOT set "channelId" here — resolveProviderConfig rejects local-mode
+	// requests with a non-empty ChannelID ("本地工作区不支持系统渠道配置").
+	// We only inject baseUrl + model + interfaceType so the execution path
+	// (OpenAI-compatible HTTP call to localhost:8198) works without needing a
+	// system channel catalog lookup.
+	cfg := map[string]any{}
+	if existing, ok := input["config"].(map[string]any); ok {
+		for k, v := range existing {
+			cfg[k] = v
+		}
+	}
+	cfg["baseUrl"] = baseURL
+	cfg["apiFormat"] = apiFormat
+	cfg["model"] = modelKey
+
+	// Local proxies (beeftv_proxy.py on this Mac) don't validate the
+	// Authorization header — they just route by model — but the executor's
+	// validatePreparedInput rejects an empty apiKey with "后端生成任务缺少
+	// Base URL、API Key 或模型名". Inject a sentinel so the request reaches
+	// the upstream; the proxy ignores the value.
+	if strings.TrimSpace(admissionString(cfg["apiKey"])) == "" {
+		cfg["apiKey"] = "local-proxy-no-auth"
+	}
+
+	// Set interface type based on capability. The local proxy (beeftv_proxy.py)
+	// exposes one OpenAI-compatible surface per capability, so we use the
+	// capability-appropriate type rather than the upstream channel-specific
+	// types like newapi-channel-2.
+	switch taskCapability {
+	case "image":
+		cfg["interfaceType"] = "openai-image"
+	case "video":
+		// Proxy exposes MiniMax H3 / Wan 2.1 text-to-video through
+		// /v1/video/generations (a WIP shim that delegates to the chat
+		// completions video path).
+		cfg["interfaceType"] = "newapi-channel-2"
+	case "audio":
+		cfg["interfaceType"] = "openai-audio"
+	case "text":
+		cfg["interfaceType"] = "chat-completion"
+	}
+
+	result := make(map[string]any, len(input))
+	for k, v := range input {
+		result[k] = v
+	}
+	result["config"] = cfg
+
+	return result, true
 }
 
 func admissionString(value any) string {
