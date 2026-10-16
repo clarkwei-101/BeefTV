@@ -2114,7 +2114,12 @@ class _NewAPIVideoRequest(BaseModel):
 
 
 def _extract_chat_video_url(payload: Any) -> Optional[str]:
-    """Pull a video URL out of an OpenAI-shaped chat completion response."""
+    """Pull a video URL out of an OpenAI-shaped chat completion response.
+
+    The non-streaming video path stores the URL as a JSON string inside
+    message.content (e.g. '{"video_url":"http://...","prompt_id":"...',
+    ...}'). Parse the JSON first, then fall back to plain text.
+    """
     if not isinstance(payload, dict):
         return None
     choices = payload.get("choices")
@@ -2127,17 +2132,28 @@ def _extract_chat_video_url(payload: Any) -> Optional[str]:
     if isinstance(message, dict):
         text = message.get("content")
         if isinstance(text, str) and text.strip():
-            return text.strip()
+            # Try parsing as JSON first (video result from non-streaming path)
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict) and parsed.get("video_url"):
+                    return parsed["video_url"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+            # Fall back to plain text URL
+            if text.strip().startswith("http"):
+                return text.strip()
     return None
 
 
-async def _run_newapi_video_generations(req: _NewAPIVideoRequest) -> JSONResponse:
-    """Adapter that makes /v1/video/generations work like the proxy's
-    /v1/chat/completions video path.
+async def _submit_video_task(req: _NewAPIVideoRequest) -> str:
+    """Submit a video job to ComfyUI and return the prompt_id immediately.
 
-    The chat completions handler blocks until ComfyUI returns a result when
-    stream=False, which lines up with the WIP client expectation that the
-    POST returns a finalised task with a video URL.
+    The WIP /v1/video/generations client expects the POST to return fast with
+    a task ID, then polls GET /v1/video/generations/{id} for status. This
+    helper submits the chat-completions streaming variant, reads just the
+    first SSE event (which carries the prompt_id), then returns. ComfyUI
+    keeps rendering in the background and the GET endpoint reads
+    /history/{id} to surface the result.
     """
     if not req.prompt.strip() and not req.image_urls:
         raise HTTPException(status_code=400, detail="prompt or image_urls is required")
@@ -2151,40 +2167,107 @@ async def _run_newapi_video_generations(req: _NewAPIVideoRequest) -> JSONRespons
         f"audios={len(req.audio_urls)}"
     )
 
+    # Translate seconds → duration (frames) so the chat-completion path picks
+    # it up. The video path inside chat_completions snaps the value to the
+    # 17k+5 frame grid automatically.
+    try:
+        seconds_val = int(req.seconds) if req.seconds else 6
+    except (TypeError, ValueError):
+        seconds_val = 6
+    duration_frames = seconds_val * 24  # H3 runs at 24fps
+
     chat_request = ChatCompletionRequest(
         model=req.model,
         messages=[Message(role="user", content=prompt_text)],
-        stream=False,
+        stream=True,
+        duration=duration_frames,
     )
 
     response = await chat_completions(chat_request)
-    if not isinstance(response, JSONResponse):
-        # Stream / unexpected response — return as-is and let the caller handle it.
-        return response
+    if not isinstance(response, StreamingResponse):
+        raise HTTPException(
+            status_code=502,
+            detail="Video submit did not return a streaming response",
+        )
 
+    # Consume just enough of the SSE stream to grab the prompt_id. FastAPI's
+    # StreamingResponse may flush the body_iterator in arbitrary chunks, so
+    # we accumulate until we see at least one full "data: {...}\n\n" event,
+    # then break out and drain the rest in the background.
+    body_iter = response.body_iterator
+    buffer = ""
+    prompt_id: Optional[str] = None
     try:
-        payload = json.loads(response.body)
+        # Keep reading small chunks (up to ~4 KB) for up to 30s.
+        deadline = asyncio.get_event_loop().time() + 30
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                chunk = await asyncio.wait_for(anext(body_iter, None), timeout=2)
+            except (asyncio.TimeoutError, StopAsyncIteration):
+                break
+            if chunk is None:
+                break
+            text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+            buffer += text
+            # A complete SSE event ends with "\n\n"; parse whatever we have.
+            for raw_line in buffer.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("data:") or line.startswith("data "):
+                    payload = line.split(":", 1)[1].strip()
+                    try:
+                        obj = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    pid = obj.get("prompt_id")
+                    if pid:
+                        prompt_id = pid
+                        break
+            if prompt_id:
+                break
     except Exception:
-        return response
+        pass
 
-    video_url = _extract_chat_video_url(payload)
-    if not video_url:
+    # Drain the rest of the stream in the background so ComfyUI's SSE keepalive
+    # is consumed (otherwise uvicorn logs warnings about an unclosed generator).
+    async def _drain() -> None:
+        try:
+            async for _ in body_iter:
+                pass
+        except Exception:
+            pass
+
+    asyncio.create_task(_drain())
+
+    if not prompt_id:
         log.error(
-            f"[newapi-shim] chat completions returned no video URL: {payload}"
+            f"[newapi-shim] No prompt_id parsed from SSE; buffer={buffer[:300]!r}"
         )
         raise HTTPException(
             status_code=502,
-            detail="ComfyUI produced no video output. The model may have failed silently.",
+            detail="Could not extract prompt_id from the SSE response",
         )
+    return prompt_id
+
+
+async def _run_newapi_video_generations(req: _NewAPIVideoRequest) -> JSONResponse:
+    """Adapter that makes /v1/video/generations work like the proxy's
+    /v1/chat/completions video path.
+
+    Submits the job to ComfyUI, returns a task ID immediately, and lets the
+    client poll GET /v1/video/generations/{id} for the result. This matches
+    the WIP /v1/video/generations contract: POST returns fast, GET polls.
+    """
+    prompt_id = await _submit_video_task(req)
 
     newapi_body = {
-        "id": f"beeftv-newapi-{uuid.uuid4()}",
+        "id": prompt_id,
         "object": "video.generation",
         "model": req.model,
-        "status": "succeeded",
+        "status": "pending",
         "seconds": req.seconds,
         "aspect_ratio": req.aspect_ratio,
-        "url": video_url,
     }
     if req.resolution:
         newapi_body["resolution"] = req.resolution
@@ -2196,7 +2279,7 @@ async def _run_newapi_video_generations(req: _NewAPIVideoRequest) -> JSONRespons
         newapi_body["video_urls"] = list(req.video_urls)
     if req.audio_urls:
         newapi_body["audio_urls"] = list(req.audio_urls)
-    return JSONResponse(newapi_body)
+    return JSONResponse(newapi_body, status_code=202)
 
 
 @app.post("/v1/video/generations")
@@ -2206,16 +2289,58 @@ async def video_generations(req: _NewAPIVideoRequest):
 
 @app.get("/v1/video/generations/{task_id}")
 async def video_generation_status(task_id: str):
-    # The proxy delivers the video URL inside the POST response (the chat
-    # completions handler blocks on ComfyUI). The WIP client still polls,
-    # so answer with a stable completed sentinel referencing the same id.
-    return JSONResponse(
-        {
-            "id": task_id,
-            "object": "video.generation",
-            "status": "succeeded",
-        }
-    )
+    # Check ComfyUI history to get real status and the video URL.
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            history_resp = await client.get(f"{COMFY_HOST}/history/{task_id}")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ComfyUI unreachable: {exc}",
+            )
+    if history_resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ComfyUI history returned {history_resp.status_code}",
+        )
+    history = history_resp.json()
+    if task_id not in history:
+        # Not in history yet — check queue to distinguish pending vs starting.
+        try:
+            queue_resp = await client.get(f"{COMFY_HOST}/queue")
+            queue = queue_resp.json()
+        except Exception:
+            queue = {}
+        running_ids = {item[1] for item in queue.get("queue_running", [])}
+        pending_ids = {item[1] for item in queue.get("queue_pending", [])}
+        if task_id in running_ids:
+            status = "processing"
+        elif task_id in pending_ids:
+            status = "pending"
+        else:
+            status = "starting"
+        return JSONResponse(
+            {
+                "id": task_id,
+                "object": "video.generation",
+                "status": status,
+            }
+        )
+
+    # Completed — extract the video URL from ComfyUI outputs.
+    outputs = history.get(task_id, {}).get("outputs", {})
+    video_url = resolve_output(outputs)
+    completed_at = history.get(task_id, {}).get("status", {}).get("completed_at")
+    resp_body = {
+        "id": task_id,
+        "object": "video.generation",
+        "status": "succeeded",
+    }
+    if video_url:
+        resp_body["url"] = video_url
+    if completed_at:
+        resp_body["completed_at"] = completed_at
+    return JSONResponse(resp_body)
 
 
 # ── Start ─────────────────────────────────────────────────────────────────────
