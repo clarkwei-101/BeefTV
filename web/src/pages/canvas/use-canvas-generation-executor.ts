@@ -189,6 +189,14 @@ export function useCanvasGenerationExecutor({
                         generationConfig = buildConfirmedGenerationConfig(inputConfig, sourceNode, mode, hydratedRequirements, options?.confirmedModelKey);
                         const hydratedCompatibilityError = usesWorkflowProvider ? "" : modelCompatibilityError(generationConfig, generationConfig.model, hydratedRequirements);
                         if (hydratedCompatibilityError) throw new Error(`当前模型无法支持这组输入和参数：${hydratedCompatibilityError}`);
+                        // 兜底的凭证校验必须放在「模型定稿」之后：buildGenerationConfig 内部的
+                        // resolveCompatibleModel 会按尺寸/能力把节点上记录的模型换成组内另一条路由，
+                        // 前面那次 isAiConfigReady 校验的是换之前的模型。少了这一步，用户会拿到
+                        // 上游「API Key 无效/未开通」的原始报错，而不是本地可执行的修复指引。
+                        if (!isAiConfigReady(generationConfig, generationConfig.model)) {
+                            navigateToSettings({ continueCreation: true });
+                            return;
+                        }
                     } catch (error) {
                         const errorDetails = generationErrorMessage(error);
                         message.error(errorDetails);
