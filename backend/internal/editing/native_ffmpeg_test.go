@@ -31,6 +31,14 @@ func TestSubtitleFontFailureWithSuccessfulExit(t *testing.T) {
 	}
 }
 
+func hasSubtitlesFilter(ffmpegBin string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpegBin, "-filters", "-hide_banner")
+	out, _ := cmd.Output()
+	return strings.Contains(string(out), "subtitles")
+}
+
 func TestRenderFFmpegSixSecondAudioAndChineseSubtitles(t *testing.T) {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -38,6 +46,9 @@ func TestRenderFFmpegSixSecondAudioAndChineseSubtitles(t *testing.T) {
 	}
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		t.Skip("ffprobe is required")
+	}
+	if !hasSubtitlesFilter(ffmpeg) {
+		t.Skip("ffmpeg subtitles filter not available (libass not compiled in)")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -326,6 +337,9 @@ func TestRenderFFmpegImageGapSubtitleTerminates(t *testing.T) {
 	}
 	if _, err := exec.LookPath("ffprobe"); err != nil {
 		t.Skip("ffprobe required")
+	}
+	if !hasSubtitlesFilter(ffmpeg) {
+		t.Skip("ffmpeg subtitles filter not available (libass not compiled in)")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

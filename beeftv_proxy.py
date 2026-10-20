@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -41,7 +42,6 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -57,6 +57,16 @@ LISTEN = os.environ.get("BEEFTV_PROXY_LISTEN", "::")
 # The base URL handed back to the browser for generated media. Override when the
 # BeefTV web app is opened from a machine other than this one.
 PUBLIC_BASE = os.environ.get("BEEFTV_PROXY_PUBLIC_BASE", f"http://localhost:{PORT}")
+# Shared secret for proxy authentication. If set, every /v1/* request must carry
+# this value in the X-Beeftv-Token header. Leave blank to disable (dev only).
+PROXY_TOKEN = os.environ.get("BEEFTV_PROXY_TOKEN", "")
+# Allowed browser origins for CORS. Commas-separated list. Defaults to localhost
+# for development; set to your public tunnel origin for production.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("BEEFTV_PROXY_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+] or ["http://localhost:3000", "http://localhost:5173"]
 
 # ── Text routing ────────────────────────────────────────────────────────────────
 # Short, cheap requests stay on the Mac so the DGX is never blocked by chat
@@ -130,14 +140,55 @@ DEFAULT_IMAGE_MODEL = os.environ.get("BEEFTV_IMAGE_MODEL", "flux-schnell")
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(title="BeefTV ComfyUI Proxy", version="1.0.0")
 
-# The BeefTV web app runs on a different port than this bridge, so the browser
-# needs CORS to read the generated media back out of the proxy.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ── Auth + CORS Middleware ─────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def auth_and_cors_middleware(request: Request, call_next):
+    """Gate /v1/* with token auth and tighten CORS origins.
+
+    • Token auth: if BEEFTV_PROXY_TOKEN is set, every /v1/* request must carry
+      X-Beeftv-Token: <token>. Requests without the header (or with a wrong
+      value) get 401. /health and /view bypass token auth so the health-check
+      and media-serving endpoints are still reachable.
+
+    • CORS: restrict Access-Control-Allow-Origin to the explicit list configured
+      in ALLOWED_ORIGINS (or localhost in dev). This replaces the previous
+      allow_origins=["*"] which leaked media URLs to any cross-origin page.
+    """
+    path = request.url.path
+
+    # ── Token auth for /v1/* ──
+    # Accept either:
+    #   • X-Beeftv-Token: <token>       (simple header, browser-friendly)
+    #   • Authorization: Bearer <token> (standard OAuth 2.0 form; used by Go backend)
+    if path.startswith("/v1/") and PROXY_TOKEN:
+        provided = (
+            request.headers.get("x-beeftv-token", "").strip()
+            or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        )
+        if not provided or not secrets.compare_digest(provided, PROXY_TOKEN):
+            log.warning(f"Unauthorized /v1/* access from {request.client.host}")
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized — missing or invalid auth token"},
+            )
+
+    # ── CORS: handle preflight and inject headers on every response ──
+    origin = request.headers.get("origin", "")
+    response: Response = await call_next(request)
+
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Beeftv-Token"
+        )
+
+    # Block framing to prevent clickjacking on the media-view endpoint.
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 # ── Request Models ────────────────────────────────────────────────────────────
 
@@ -1338,6 +1389,67 @@ def should_use_deepseek(messages: List[Message]) -> bool:
     return total > LONG_PROMPT_CHARS
 
 
+# Qwen3 thinking-mode models write the user-visible answer into
+# ``message.thinking`` (or a ``<think>...</think>`` block at the head of
+# ``message.content``) and leave ``message.content`` empty. Shipping that
+# empty string back to an OpenAI-shaped client looked like a silent 200-OK
+# failure, so we now strip the think block and fall back to the thinking
+# field when needed.
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def extract_text_from_ollama_response(data: Dict[str, Any]) -> str:
+    """Pull the user-visible answer out of an Ollama ``/api/chat`` response.
+
+    Order of preference:
+    1. ``message.content`` after stripping any leading ``<think>`` block.
+    2. ``message.thinking`` after the same strip, with the obvious
+       monologue pattern (the model repeating a phrase while it deliberates)
+       trimmed from the tail.
+    3. Empty string — caller decides how to surface this.
+    """
+    message = data.get("message") or {}
+    content = (message.get("content") or "").strip()
+    thinking = (message.get("thinking") or "").strip()
+
+    if content:
+        content = _THINK_BLOCK_RE.sub("", content).strip()
+        if content:
+            return content
+
+    if not thinking:
+        return ""
+
+    thinking = _THINK_BLOCK_RE.sub("", thinking).strip()
+    if not thinking:
+        return ""
+
+    # The thinking trace often ends with the model deliberating about a
+    # short phrase it is trying to count, e.g. "Hello (1), how (2), are (3),
+    # you (4)? No, that's four words. Wait, ...". Look for the last
+    # numbered-counting line ("Wait, ...", "No, ...", "Let me count ...")
+    # and cut there. Failing that, cut at the last blank line and keep the
+    # last paragraph.
+    cut_markers = [
+        r"\n\s*Wait[,，].*$",
+        r"\n\s*No[,，].*$",
+        r"\n\s*Let me (count|think|re-?count).*$",
+        r"\n\s*Hmm[,.]?.*$",
+        r"\n\s*Alternatively[,，]?.*$",
+        r"\n\s*Maybe.*$",
+    ]
+    best = thinking
+    for marker in cut_markers:
+        m = re.search(marker, best, flags=re.DOTALL)
+        if m:
+            best = best[: m.start()].rstrip()
+            break
+    if best:
+        return best
+
+    return thinking
+
+
 async def ollama_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
     """Chat via the Mac Studio's local Ollama."""
     options: Dict[str, Any] = {}
@@ -1356,10 +1468,20 @@ async def ollama_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
     }
     if options:
         payload["options"] = options
+    # Qwen3 is a thinking-mode model. By default it spends most of its
+    # output budget deliberating in ``message.thinking`` and leaves
+    # ``message.content`` empty until it is happy with the answer — for
+    # short prompts the user only sees a stream of "let me count the
+    # words ..." with no final response. ``think: false`` (Ollama ≥ 0.5)
+    # skips the deliberation phase entirely and forces the model to
+    # answer directly in ``content``. The OpenAI-shaped client then sees
+    # a real answer instead of an empty bubble.
+    payload["think"] = False
     async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
     resp.raise_for_status()
     data = resp.json()
+    raw_content = extract_text_from_ollama_response(data)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
         "object": "chat.completion",
@@ -1368,7 +1490,7 @@ async def ollama_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": data.get("message", {}).get("content", "")},
+                "message": {"role": "assistant", "content": raw_content if raw_content else "（模型只返回了思考过程，没有可显示的答案。）"},
                 "finish_reason": "stop",
             }
         ],
@@ -1933,23 +2055,111 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # ── Video routing ──
     # MiniMax H3 first-render loads ~22 GB of weights and can take 1-3 min
-    # before any output appears. Streaming by default lets the browser show
-    # a live "loading model" / "running sampler" spinner instead of looking
-    # dead. A caller that really wants the old single-shot JSON response
-    # can opt out by sending ``"stream": false`` explicitly.
+    # before any output appears. The default behaviour is therefore to
+    # return a 202 + task_id immediately and let the caller poll
+    # ``GET /v1/video/generations/{task_id}`` for status — this is the
+    # same contract the dedicated ``/v1/video/generations`` endpoint
+    # already exposes, and it lets the frontend show a "queued / loading
+    # model" spinner instead of looking dead. A caller that really wants
+    # the old SSE-streamed chat.completion response can opt in by sending
+    # ``"stream": true`` explicitly.
     is_video_model = any(
         key in model_id
         for key in ("minimax", "wan", "t2v", "i2v", "video")
     )
     if is_video_model:
-        # Pydantic does not distinguish "user sent false" from "default false",
-        # so use model_fields_set to know if the client intentionally set
-        # stream=False. If they did not, force streaming on.
-        req_fields = (
-            req.model_fields_set if hasattr(req, "model_fields_set") else set()
+        # Pull the prompt out of the last user message.
+        user_prompts = [m.content for m in req.messages if m.role == "user"]
+        if not user_prompts or not user_prompts[-1].strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Video model {req.model!r} requires a non-empty 'user' "
+                    "message containing the prompt."
+                ),
+            )
+        actual_prompt = user_prompts[-1].strip()
+
+        # Build the H3 / Wan workflow and submit it directly to ComfyUI.
+        # This mirrors the dedicated /v1/video/generations path but keeps
+        # the call in-process so we don't recurse through
+        # ``_submit_video_task`` (which itself calls ``chat_completions``).
+        width = req.width or 1344
+        height = req.height or 768
+        seed = req.seed or 0
+        steps = req.steps or 4
+        negative = req.negative_prompt or ""
+        client_id = str(uuid.uuid4())
+
+        if "wan" in model_id or "2.1" in model_id:
+            log.warning(
+                "Wan 2.1 is not installed on the DGX — aliasing to minimax-h3"
+            )
+            model_id = "minimax-h3"
+        if negative:
+            log.info(
+                f"Dropping unsupported negative_prompt for {req.model} "
+                f"(H3 node does not accept it): {negative[:60]}"
+            )
+
+        length = max(17, ((req.duration - 5) // 17) * 17 + 5)
+        if length != req.duration:
+            log.info(
+                f"Adjusted length_frames {req.duration} -> {length} for H3 grid"
+            )
+
+        workflow = build_minimax_h3_workflow(
+            prompt=actual_prompt,
+            width=width,
+            height=height,
+            length_frames=length,
+            seed=seed,
+            steps=steps,
+            shift_video=req.shift_video,
+            shift_audio=req.shift_audio,
+            turbo_mode=req.turbo,
+            filename_prefix="video/BeefTV",
         )
-        if "stream" not in req_fields:
-            req = req.model_copy(update={"stream": True})
+
+        try:
+            prompt_id = await comfy_prompt(workflow, client_id)
+            log.info(
+                f"[{prompt_id}] Submitted {req.model} job, client={client_id}"
+            )
+        except Exception as e:
+            log.error(f"Failed to submit ComfyUI prompt: {e}")
+            raise HTTPException(
+                status_code=502, detail=f"ComfyUI error: {e}"
+            )
+
+        # Caller asked for the old SSE streaming chat.completion response
+        # — fall through to the live stream.
+        if req.stream:
+            return StreamingResponse(
+                sse_stream(prompt_id, req.model, release_vram=True),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "x-beeftv-backend": f"comfyui/{COMFY_HOST}",
+                },
+            )
+
+        # Default async response: 202 + task_id, matches
+        # ``/v1/video/generations`` so the same poller works.
+        body = {
+            "id": prompt_id,
+            "object": "video.generation",
+            "model": req.model,
+            "status": "queued",
+            "prompt": actual_prompt,
+            "poll_url": f"/v1/video/generations/{prompt_id}",
+        }
+        return JSONResponse(
+            body,
+            status_code=202,
+            headers={"x-beeftv-backend": f"comfyui/{COMFY_HOST}"},
+        )
 
     # Extract prompt from last user message. The previous regex matched only
     # prompts that started with the literal "prompt:" prefix; everything else

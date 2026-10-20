@@ -42,6 +42,8 @@ export default defineConfig({
         "import.meta.env.VITE_APP_VERSION": JSON.stringify(appVersion),
     },
     server: {
+        host: "0.0.0.0",
+        allowedHosts: true,
         proxy: {
             "/api": {
                 target: apiProxyTarget,

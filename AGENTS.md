@@ -138,3 +138,25 @@ BeefTV（`glanderness/BeefTV`）是面向 AI 影视与短剧创作的工作台�
 - Git 提交说明使用 `<type>(<scope>): <业务模块> - <变更摘要>`，`type` 为 `feat|fix|refactor|perf|docs|test|build|ci|chore|revert`。
 
 交付前至少检查：改动是否聚焦、调用方和类型是否同步、错误/权限/数据归属是否完整、必要文档是否同步、验证是否如实说明、是否留下密钥或本地数据。
+
+## 10. Beeftv OpenAI-Compatible Proxy (`beeftv_proxy.py`)
+
+`beeftv_proxy.py` 是宿主机 `:8198` 上的 OpenAI 兼容入口，把 DGX Spark + 本机 Ollama/Piper/ComfyUI 包装成 `/v1/chat/completions` / `/v1/images/*` / `/v1/audio/*` / `/v1/video/generations`。三段已知契约：
+
+- **Ollama text 路径（`ollama_chat`）**：调用 `POST http://127.0.0.1:11434/api/chat`。qwen3 系列是 thinking-mode 模型，**必须**在 payload 里加 `"think": false`，否则模型把所有 token 写到 `message.thinking`，`message.content` 留空，对 OpenAI 客户端呈现"200 OK + 0 字节回答"。代理同时保留 `extract_text_from_ollama_response()` 作为 Ollama 老版本（无 `think` 字段）的 fallback：先剥 `<think>...</think>` 块，再去 thinking 末尾的重复短句模式（"Wait," / "No," / "Let me count" / "Alternatively" / "Maybe" 段头），最后才回退到完整 thinking 字符串或一条"模型只返回了思考过程"的兜底。
+- **Video 路径**：`POST /v1/chat/completions` 收到 `model` 含 `minimax` / `wan` / `t2v` / `i2v` / `video` 时，**默认**直接构造 H3 workflow、调 `comfy_prompt()`、返回 `202 Accepted` + `{id, object: "video.generation", status: "queued", poll_url: "/v1/video/generations/<id>"}`。客户端通过 `GET /v1/video/generations/<id>` 轮询；只有显式 `stream: true` 才会切到老的 SSE 心跳。空 user message 抛 `400`。H3 第一次加载 ~22 GB 权重，1-3 分钟内不返回任何内容属正常 — 选 polling 而非阻塞 curl。
+- **不要让 `chat_completions` 调 `_run_newapi_video_generations`**：后者内部又调一次 `chat_completions`，会形成无限递归 500。视频分支在 chat 路由里就地处理，**不**复用 newapi 适配器。
+
+启动：`pkill -f beeftv_proxy.py; sleep 1; nohup python3 beeftv_proxy.py > /tmp/beeftv-proxy.log 2>&1 &`。日志在 `/tmp/beeftv-proxy.log`，重启用上面那行；不要写 systemd unit。
+
+## 11. Cursor Skill Hub (`~/.cursor/plugins/local/ai-vfx-hub/`)
+
+AI 视频/图片生成的 12 个 Skill 集中放在 `~/.cursor/plugins/local/ai-vfx-hub/`，插件 manifest 在 `.cursor-plugin/plugin.json`，每个 Skill 一个目录含 `SKILL.md`（YAML frontmatter `name` + `description`）。Cursor 启动后会自动出现在 skill 列表里，agent 看到 `name` 描述命中就 load。
+
+- 写作约定：每个 Skill 必须**可执行**，不能只写背景；至少 1-2 条真实 curl / 命令示范，端点要命中用户本机（`localhost:8198` 走 BeefTV proxy，`192.168.1.193:8188` 走 DGX Spark ComfyUI，`localhost:11434` 走 Ollama）。
+- 跨引用零 404：`bundled/<sub-skill>/SKILL.md` 这种相对路径必须真的有目标文件。
+- 不可嵌入任何真实 API Key；Ollama / 本机 ComfyUI 不需要 key，第三方 API 只在文档里写 `os.environ['XXX']`。
+- 不要覆盖 `~/.cursor/skills/seedance-prompt-en/` 或 `~/.cursor/skills/seedance-prompt-zh/`（已存在，直接引用）。
+- 装新 Skill 时同步加到 `README.md` 的快速开始表，否则用户找不到。
+
+Hypit 完整安装会拉 ~10GB 依赖、跑 5-15 分钟，单独派给 background worker，装完报告 frontmatter 校验 + cross-ref 检查。
