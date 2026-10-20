@@ -100,7 +100,7 @@ async function resolveVideoGenerationsUrl(value: string | undefined, storageKey?
     if (inline && storageKey?.startsWith("resource:")) {
         const blob = await getResourceBlob(storageKey);
         if (!blob) throw new Error("参考素材无法读取，请重新导入后重试");
-        if (maxBytes > 0 && blob.size > maxBytes) throw new Error("参考图片超过当前模型的大小限制，请压缩后重新导入");
+        if (maxBytes > 0 && inlineBlobExceedsBudget(blob, maxBytes)) throw new Error("参考图片超过当前模型的大小限制，请压缩后重新导入");
         return blobToDataUrl(blob);
     }
     if (inline && value?.startsWith("data:")) {
@@ -110,6 +110,24 @@ async function resolveVideoGenerationsUrl(value: string | undefined, storageKey?
     if (storageKey?.startsWith("resource:")) return getResourceOSSUrl(storageKey);
     if (isPublicMediaUrl(value || "")) return String(value);
     throw new Error("NewAPI Video Generations 的参考素材需要公网 URL；本地素材不能直接发送到该渠道，请改用支持本地素材的渠道或提供公网素材地址");
+}
+
+// 参考模型实际收到的是 base64 后的 data URL（≈ 4/3 倍率 + 「data:image/...;base64,」前缀）。
+// 上传前对「raw 字节」必须用与 data: 分支同一把尺子过一遍，否则原始 28.5MB 的 PNG 在 30MB 上限的
+// 模型下被前端放过却被模型端拒收，给用户返回一个无法对症的「过大」提示。函数内的 +256 留白与
+// 上方 data: 分支保持一致（URL 头 + 末尾 padding 上限），避免两个分支给出不同的拒绝边界。
+function inlineBlobExceedsBudget(blob: Blob, maxBytes: number) {
+    // 模型实际收到的是 base64 后的 data URL（≈ 4/3 倍率 + 「data:...;base64,」前缀），
+    // 因此用与 data: 分支一致的公式反推「raw 字节上限」。两分支必须共用同一边界，
+    // 否则 30MB 上限下，原始 28.5MB 的 PNG 仍会被前端放过而被模型端拒收。
+    const dataUrlLength = Math.ceil(blob.size / 3) * 4 + estimateDataUrlPrefixLength(blob);
+    return dataUrlLength > Math.ceil(maxBytes / 3) * 4 + 256;
+}
+
+function estimateDataUrlPrefixLength(blob: Blob) {
+    // 不知道 mime 的情况下用最小保守前缀，避免漏放过；负向判定收紧比放宽安全。
+    const mime = String(blob.type || "").trim() || "application/octet-stream";
+    return `data:${mime};base64,`.length;
 }
 
 function isPublicMediaUrl(value: string) {
