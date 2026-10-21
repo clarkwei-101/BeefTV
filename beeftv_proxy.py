@@ -37,11 +37,12 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -146,6 +147,25 @@ DEFAULT_IMAGE_MODEL = os.environ.get("BEEFTV_IMAGE_MODEL", "flux-schnell")
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(title="BeefTV ComfyUI Proxy", version="1.0.0")
 
+
+@app.exception_handler(RequestValidationError)
+async def log_request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Log which field was rejected before the 422 reaches the client.
+
+    A bare 422 with no body is impossible to act on: the caller cannot tell
+    whether the payload was malformed or simply carried a field the request
+    model does not know yet. The machine-readable detail is still returned
+    unchanged; this only adds the request path and the rejected field names
+    to the log.
+    """
+    rejected = sorted({str(item.get("loc", ["?"])[-1]) for item in exc.errors()})
+    logging.warning(
+        "request validation failed path=%s fields=%s",
+        request.url.path,
+        ",".join(rejected),
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
 # ── Auth + CORS Middleware ─────────────────────────────────────────────────────
 
 @app.middleware("http")
@@ -201,7 +221,59 @@ async def auth_and_cors_middleware(request: Request, call_next):
 
 class Message(BaseModel):
     role: str
-    content: str
+    # Multimodal turns send ``content`` as a list of parts instead of a plain
+    # string. Accept both and keep the parts so the upstream model sees them.
+    content: Union[str, List[Dict[str, Any]], None] = None
+    # Assistant turns can carry tool calls, and tool results come back as
+    # separate messages. Both are required for the agent host to run a turn.
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    reasoning_content: Optional[str] = None
+
+
+class ToolDefinition(BaseModel):
+    """One OpenAI function-tool declaration."""
+
+    type: str = "function"
+    function: Dict[str, Any] = Field(default_factory=dict)
+
+
+def openai_message_payload(message: Message) -> Dict[str, Any]:
+    """Project one request message into the OpenAI chat wire shape.
+
+    ``content`` may be a plain string or a list of multimodal parts. The list
+    form is forwarded verbatim because the upstream model understands it;
+    only the extra assistant/tool bookkeeping fields are dropped or renamed.
+    """
+    payload: Dict[str, Any] = {"role": message.role, "content": message.content}
+    if message.tool_calls:
+        payload["tool_calls"] = message.tool_calls
+    if message.tool_call_id:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.name:
+        payload["name"] = message.name
+    return payload
+
+
+def message_text(message: Message) -> str:
+    """Flatten a request message into plain text.
+
+    Multimodal turns send ``content`` as a list of parts; the prompt-length
+    heuristics and the video prompt extraction only understand text.
+    """
+    content = message.content
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: List[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") in ("text", "input_text"):
+            parts.append(str(part.get("text", "")))
+    return "\n".join(parts)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -213,8 +285,27 @@ class ChatCompletionRequest(BaseModel):
     model: str = "minimax-h3"
     messages: List[Message] = Field(default_factory=list)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
+    # The agent SDK prefers the newer spelling. Both are accepted and
+    # forwarded; the upstream model only understands ``max_tokens``.
+    max_completion_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     stream: bool = False
+    # Standard OpenAI chat fields. The agent host (pi SDK) always sends
+    # ``tools``/``tool_choice``; rejecting them made every assistant turn
+    # fail with 422 before the request ever reached the upstream model.
+    tools: Optional[List[ToolDefinition]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    stop: Optional[Union[str, List[str]]] = None
+    presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+    n: Optional[int] = Field(default=None, ge=1)
+    response_format: Optional[Dict[str, Any]] = None
+    # OpenAI Responses-style switches. They carry no meaning for a local
+    # OpenAI-compatible backend, but the SDK always sends them, so rejecting
+    # them broke every assistant turn.
+    store: Optional[bool] = None
+    stream_options: Optional[Dict[str, Any]] = None
     width: int = Field(default=1344, ge=64, le=4096)
     height: int = Field(default=768, ge=64, le=4096)
     duration: int = Field(default=124, ge=17, le=409)
@@ -1391,7 +1482,21 @@ def _strip_emoji(text: str) -> str:
 def should_use_deepseek(messages: List[Message]) -> bool:
     """Short chat stays on the Mac's Ollama; anything substantial moves to the
     DGX's DeepSeek V4, which has the context length to actually handle it."""
-    total = sum(len(m.content) for m in messages)
+    total = 0
+    for message in messages:
+        content = message.content
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            # Multimodal content parts: count the text parts, and treat any
+            # non-text part (image, audio) as a substantial prompt.
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in ("text", "input_text"):
+                    total += len(str(part.get("text", "")))
+                else:
+                    total += LONG_PROMPT_CHARS
     return total > LONG_PROMPT_CHARS
 
 
@@ -1469,11 +1574,15 @@ async def ollama_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
         options["num_predict"] = req.max_tokens
     payload: Dict[str, Any] = {
         "model": OLLAMA_MODEL,
-        "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+        "messages": [openai_message_payload(m) for m in req.messages],
         "stream": False,
     }
     if options:
         payload["options"] = options
+    # Ollama accepts OpenAI-style tool declarations. Forward them so the
+    # assistant host can drive canvas operations on the Ollama path too.
+    if req.tools:
+        payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
     # Qwen3 is a thinking-mode model. By default it spends most of its
     # output budget deliberating in ``message.thinking`` and leaves
     # ``message.content`` empty until it is happy with the answer — for
@@ -1488,6 +1597,29 @@ async def ollama_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
     resp.raise_for_status()
     data = resp.json()
     raw_content = extract_text_from_ollama_response(data)
+    # Ollama returns tool calls in its own shape; the OpenAI-compatible client
+    # expects ``choices[].message.tool_calls``. Normalise so the assistant host
+    # can execute the operation and continue the turn.
+    raw_tool_calls = data.get("message", {}).get("tool_calls") or []
+    tool_calls = []
+    for index, call in enumerate(raw_tool_calls):
+        function = call.get("function", {}) if isinstance(call, dict) else {}
+        tool_calls.append({
+            "id": call.get("id", f"call_{index}") if isinstance(call, dict) else f"call_{index}",
+            "type": "function",
+            "function": {
+                "name": function.get("name", ""),
+                "arguments": function.get("arguments", "{}"),
+            },
+        })
+    message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": raw_content if raw_content else "",
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    elif not raw_content:
+        message["content"] = "（模型只返回了思考过程，没有可显示的答案。）"
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
         "object": "chat.completion",
@@ -1496,8 +1628,8 @@ async def ollama_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": raw_content if raw_content else "（模型只返回了思考过程，没有可显示的答案。）"},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": {
@@ -1531,13 +1663,31 @@ async def deepseek_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
     await ensure_dgx_headroom(DEEPSEEK_MIN_FREE_VRAM_GB)
     payload: Dict[str, Any] = {
         "model": DEEPSEEK_MODEL,
-        "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+        "messages": [openai_message_payload(m) for m in req.messages],
         "stream": False,
     }
     if req.temperature is not None:
         payload["temperature"] = req.temperature
     if req.max_tokens:
         payload["max_tokens"] = req.max_tokens
+    elif req.max_completion_tokens:
+        payload["max_tokens"] = req.max_completion_tokens
+    if req.top_p is not None:
+        payload["top_p"] = req.top_p
+    if req.stop is not None:
+        payload["stop"] = req.stop
+    if req.presence_penalty is not None:
+        payload["presence_penalty"] = req.presence_penalty
+    if req.frequency_penalty is not None:
+        payload["frequency_penalty"] = req.frequency_penalty
+    if req.response_format is not None:
+        payload["response_format"] = req.response_format
+    # Tool declarations must reach the model, otherwise the assistant host
+    # can never call a canvas operation.
+    if req.tools:
+        payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
+        if req.tool_choice is not None:
+            payload["tool_choice"] = req.tool_choice
     async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT) as client:
         resp = await client.post(f"{DEEPSEEK_URL}/v1/chat/completions", json=payload)
     resp.raise_for_status()
@@ -1567,6 +1717,7 @@ async def _text_sse_stream(req, want_deepseek, backend):
         ],
     }
     yield "data: " + json.dumps(role_chunk) + "\n\n"
+
     async def emit(content, finish=None):
         chunk = {
             "id": completion_id,
@@ -1579,6 +1730,19 @@ async def _text_sse_stream(req, want_deepseek, backend):
         }
         yield "data: " + json.dumps(chunk) + "\n\n"
 
+    async def emit_delta(delta, finish=None):
+        """Forward an arbitrary delta (content, tool_calls, role)."""
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": req.model,
+            "choices": [
+                {"index": 0, "delta": delta, "finish_reason": finish}
+            ],
+        }
+        yield "data: " + json.dumps(chunk) + "\n\n"
+
     if want_deepseek:
         try:
             await ensure_dgx_headroom(DEEPSEEK_MIN_FREE_VRAM_GB)
@@ -1586,13 +1750,28 @@ async def _text_sse_stream(req, want_deepseek, backend):
             log.warning(f"VRAM probe failed; proceeding anyway: {exc}")
         payload = {
             "model": DEEPSEEK_MODEL,
-            "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+            "messages": [openai_message_payload(m) for m in req.messages],
             "stream": True,
         }
         if req.temperature is not None:
             payload["temperature"] = req.temperature
         if req.max_tokens:
             payload["max_tokens"] = req.max_tokens
+        elif req.max_completion_tokens:
+            payload["max_tokens"] = req.max_completion_tokens
+        if req.top_p is not None:
+            payload["top_p"] = req.top_p
+        if req.stop is not None:
+            payload["stop"] = req.stop
+        if req.response_format is not None:
+            payload["response_format"] = req.response_format
+        # Tool declarations must be forwarded in streaming mode too. Without
+        # them the model answers the assistant host in prose instead of
+        # emitting native tool calls, so the canvas is never touched.
+        if req.tools:
+            payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
+            if req.tool_choice is not None:
+                payload["tool_choice"] = req.tool_choice
         async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT) as client:
             async with client.stream(
                 "POST", f"{DEEPSEEK_URL}/v1/chat/completions", json=payload
@@ -1610,21 +1789,41 @@ async def _text_sse_stream(req, want_deepseek, backend):
                         except json.JSONDecodeError:
                             continue
                         for choice in obj.get("choices", []):
-                            delta = choice.get("delta", {}).get("content") or ""
+                            raw_delta = choice.get("delta", {}) or {}
+                            delta = raw_delta.get("content") or ""
                             if delta:
                                 async for piece in emit(delta):
+                                    yield piece
+                            # Tool-call deltas carry the function name and
+                            # argument fragments. They must reach the client
+                            # verbatim or the agent host never sees a call.
+                            tool_deltas = raw_delta.get("tool_calls")
+                            if tool_deltas:
+                                async for piece in emit_delta({"tool_calls": tool_deltas}):
+                                    yield piece
+                            upstream_finish = choice.get("finish_reason")
+                            if upstream_finish:
+                                async for piece in emit_delta({}, finish=upstream_finish):
                                     yield piece
     else:
         payload = {
             "model": OLLAMA_MODEL,
-            "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+            "messages": [openai_message_payload(m) for m in req.messages],
             "stream": True,
         }
         if req.temperature is not None:
             payload["options"] = {"temperature": req.temperature}
+        if req.max_tokens:
+            payload["options"] = {**payload.get("options", {}), "num_predict": req.max_tokens}
+        # Tool declarations must be forwarded in streaming mode too, otherwise
+        # the model answers the assistant host in prose instead of calling a
+        # canvas operation.
+        if req.tools:
+            payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
         async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
             async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
+                tool_call_index = 0
                 async for line in resp.aiter_lines():
                     if not line:
                         continue
@@ -1635,6 +1834,24 @@ async def _text_sse_stream(req, want_deepseek, backend):
                     content = obj.get("message", {}).get("content")
                     if content:
                         async for piece in emit(content):
+                            yield piece
+                    # Ollama streams tool calls as complete objects; convert them
+                    # into the OpenAI tool_calls delta shape.
+                    for call in obj.get("message", {}).get("tool_calls") or []:
+                        function = call.get("function", {}) if isinstance(call, dict) else {}
+                        delta = {
+                            "tool_calls": [{
+                                "index": tool_call_index,
+                                "id": call.get("id", f"call_{tool_call_index}") if isinstance(call, dict) else f"call_{tool_call_index}",
+                                "type": "function",
+                                "function": {
+                                    "name": function.get("name", ""),
+                                    "arguments": function.get("arguments", "{}"),
+                                },
+                            }],
+                        }
+                        tool_call_index += 1
+                        async for piece in emit_delta(delta):
                             yield piece
                     if obj.get("done"):
                         break
@@ -2075,7 +2292,7 @@ async def chat_completions(req: ChatCompletionRequest):
     )
     if is_video_model:
         # Pull the prompt out of the last user message.
-        user_prompts = [m.content for m in req.messages if m.role == "user"]
+        user_prompts = [message_text(m) for m in req.messages if m.role == "user"]
         if not user_prompts or not user_prompts[-1].strip():
             raise HTTPException(
                 status_code=400,
@@ -2172,7 +2389,7 @@ async def chat_completions(req: ChatCompletionRequest):
     # fell through with the raw user content (including any preamble like
     # "Generate a video of a cat, 10 seconds"). The ComfyUI H3 graph already
     # accepts the full string, so just use the raw prompt verbatim.
-    user_prompts = [m.content for m in req.messages if m.role == "user"]
+    user_prompts = [message_text(m) for m in req.messages if m.role == "user"]
     raw_prompt = user_prompts[-1] if user_prompts else ""
     actual_prompt = raw_prompt.strip()
 
@@ -2269,7 +2486,7 @@ async def chat_completions(req: ChatCompletionRequest):
         # expose prompt/eval counts the way Ollama does. Emit null counts
         # instead of the previous hardcoded 10/50/60, which silently misattributed
         # usage to whichever caller happened to send ``stream: false``.
-        prompt_chars = sum(len(m.content) for m in req.messages)
+        prompt_chars = sum(len(message_text(m)) for m in req.messages)
         estimated_prompt_tokens = max(1, prompt_chars // 4)
         return JSONResponse(
             {
