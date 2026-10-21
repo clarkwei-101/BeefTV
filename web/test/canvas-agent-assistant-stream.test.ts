@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 /**
  * NDJSON 回合流的确定性边界用例：分片切割、末尾无换行、中途断流。
@@ -8,6 +8,11 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 const requests: Array<{ url: string; method: string; body: string }> = [];
 let chatResponse: (() => Response | Promise<Response>) | null = null;
 let sessionResponse: (() => Response) | null = null;
+// bun test 在同一进程内跑所有测试文件；这里替换的是全局 fetch，
+// 必须在文件结束时还原，否则后面依赖真实 HTTP 的用例
+// （例如 canvas-archive-sqlite-restore 打后端 /api/health/ready）
+// 会拿到本文件的 mock 响应。
+const originalFetch = globalThis.fetch;
 
 mock.module("@/services/api/request", () => ({
 	apiBaseURL: "http://127.0.0.1:54321/api",
@@ -82,6 +87,15 @@ beforeEach(() => {
 
 afterEach(() => {
     resetAgentUiSession();
+});
+
+afterAll(() => {
+    // bun test 在同一进程内跑多个测试文件时，这个替换会漏给后面的文件：
+    // canvas-archive-sqlite-restore 要用真实 fetch 探后端 /api/health/ready，
+    // 拿到本文件的 mock 响应就会一直等不到就绪。
+    // 注意：mock.module 的替换不能靠 mock.restore() 还原（Bun 里不可靠），
+    // 真正的隔离由 scripts/run-test-suite.mjs 负责（带 mock.module 的文件单独起进程）。
+    globalThis.fetch = originalFetch;
 });
 
 const TURN_END = JSON.stringify({ type: "turn_end", reply: "完成", toolCalls: [], error: null, cancelled: false });
