@@ -6,6 +6,7 @@ failed with a bare 422 before it ever reached the upstream model.
 """
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -141,3 +142,23 @@ def test_openai_message_payload_keeps_tool_fields():
     payload = beeftv_proxy.openai_message_payload(message)
     assert payload["tool_calls"]
     assert payload["content"] is None
+
+
+def test_tool_call_arguments_stringifies_ollama_object():
+    """Ollama returns arguments as a decoded object.
+
+    OpenAI defines ``function.arguments`` as a string, and clients call
+    ``JSON.parse`` on it unconditionally — a dict there raises and kills
+    the turn before the tool runs.
+    """
+    encoded = beeftv_proxy.tool_call_arguments({"title": "Hello"})
+    assert isinstance(encoded, str)
+    assert json.loads(encoded) == {"title": "Hello"}
+
+
+def test_tool_call_arguments_passes_string_through():
+    assert beeftv_proxy.tool_call_arguments('{"title":"Hello"}') == '{"title":"Hello"}'
+
+
+def test_tool_call_arguments_defaults_to_empty_object():
+    assert beeftv_proxy.tool_call_arguments(None) == "{}"

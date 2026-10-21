@@ -256,6 +256,25 @@ def openai_message_payload(message: Message) -> Dict[str, Any]:
     return payload
 
 
+def tool_call_arguments(raw: Any) -> str:
+    """Normalise tool-call arguments to the OpenAI wire shape.
+
+    OpenAI defines ``function.arguments`` as a **string** holding JSON.
+    Ollama returns a decoded object instead, and some clients call
+    ``JSON.parse`` on the value unconditionally — a dict there raises and
+    the whole turn dies before the tool ever runs. Serialising a dict back
+    to JSON keeps the contract; a string is passed through unchanged.
+    """
+    if isinstance(raw, str):
+        return raw
+    if raw is None:
+        return "{}"
+    try:
+        return json.dumps(raw, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return "{}"
+
+
 def message_text(message: Message) -> str:
     """Flatten a request message into plain text.
 
@@ -1609,7 +1628,7 @@ async def ollama_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
             "type": "function",
             "function": {
                 "name": function.get("name", ""),
-                "arguments": function.get("arguments", "{}"),
+                "arguments": tool_call_arguments(function.get("arguments")),
             },
         })
     message: Dict[str, Any] = {
@@ -1846,7 +1865,7 @@ async def _text_sse_stream(req, want_deepseek, backend):
                                 "type": "function",
                                 "function": {
                                     "name": function.get("name", ""),
-                                    "arguments": function.get("arguments", "{}"),
+                                    "arguments": tool_call_arguments(function.get("arguments")),
                                 },
                             }],
                         }
