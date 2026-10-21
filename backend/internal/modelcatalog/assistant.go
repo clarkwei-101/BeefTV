@@ -16,11 +16,15 @@ const (
 
 // assistantProtocols 是助手会话支持的文本协议。配置里历史上同时出现
 // "responses" 与 "openai-response" 两种写法，这里都接受并归一。
+// "openai" 是本机部署脚本与迁移工具长期写出的通用写法，文本能力一律
+// 归一到 "chat-completion"；写在这里而不是让调用方各自判断，是为了让
+// 渠道配置只有一个协议解析入口。
 var assistantProtocols = map[string]string{
 	"chat-completion": "chat-completion",
 	"claude-api":      "claude-api",
 	"responses":       "responses",
 	"openai-response": "responses",
+	"openai":          "chat-completion",
 }
 
 var managedAssistantModels = []string{beefapi.DefaultManagedAssistantModel, "claude-opus-5-5", "deepseek-v4.1-flash", "glm-5.3"}
