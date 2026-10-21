@@ -109,8 +109,21 @@ globalThis.fetch = async (input, options = {}) => {
     }
     dispatched += 1;
     let bodyModel = null;
-    try { bodyModel = JSON.parse(options.body || '{}').model || null; } catch { /* 非 JSON body */ }
-    const entry = { at: new Date().toISOString(), dispatchIndex: dispatched, origin: parsed.origin, path: parsed.pathname, model: bodyModel };
+    let bodyTools = [];
+    try {
+      const body = JSON.parse(options.body || '{}');
+      bodyModel = body.model || null;
+      // Record which tools were advertised. A turn that returns prose instead
+      // of a tool call is almost always a missing tool declaration, and the
+      // ledger is the only place that shows what the model was offered.
+      bodyTools = Array.isArray(body.tools)
+        ? body.tools.map((tool) => tool?.function?.name || tool?.name || '?')
+        : [];
+    } catch { /* 非 JSON body */ }
+    const entry = {
+      at: new Date().toISOString(), dispatchIndex: dispatched, origin: parsed.origin,
+      path: parsed.pathname, model: bodyModel, tools: bodyTools,
+    };
     outbound.push(entry);
     fs.appendFileSync(ledgerPath, JSON.stringify(entry) + '\n');
   }
