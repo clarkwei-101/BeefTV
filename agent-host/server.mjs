@@ -79,9 +79,21 @@ async function initializeModel() {
   }
 }
 
+// 只保留最近若干条出站记录：内存里的 outbound 数组必须封顶，
+// 否则长驻本机的宿主会随请求数线性增长。完整流水仍然写进磁盘账本。
+const OUTBOUND_MEMORY_LIMIT = 200;
 const outbound = [];
 const ledgerPath = path.join(DATA_DIR, 'agent-requests.jsonl');
 let dispatched = 0;
+// 账本写入串行排队，保证磁盘上的顺序与出站顺序一致。
+let ledgerWrite = Promise.resolve();
+
+function recordOutbound(entry) {
+  outbound.push(entry);
+  if (outbound.length > OUTBOUND_MEMORY_LIMIT) {
+    outbound.splice(0, outbound.length - OUTBOUND_MEMORY_LIMIT);
+  }
+}
 
 const lifetimeBudgetPath = path.join(DATA_DIR, 'agent-request-budget.json');
 const lifetimeBudget = createDurableRequestBudget({ limit: LIFETIME_REQUEST_BUDGET, file: lifetimeBudgetPath });
@@ -124,8 +136,12 @@ globalThis.fetch = async (input, options = {}) => {
       at: new Date().toISOString(), dispatchIndex: dispatched, origin: parsed.origin,
       path: parsed.pathname, model: bodyModel, tools: bodyTools,
     };
-    outbound.push(entry);
-    fs.appendFileSync(ledgerPath, JSON.stringify(entry) + '\n');
+    recordOutbound(entry);
+    // 账本是可观测性产物，不该阻塞事件循环。串行追加保持写入顺序，
+    // 失败只记日志——账本写不进去不能影响这一轮模型请求。
+    ledgerWrite = ledgerWrite
+      .then(() => fs.promises.appendFile(ledgerPath, JSON.stringify(entry) + '\n'))
+      .catch((error) => { console.error(`agent-host: 账本写入失败 ${error?.message || error}`); });
   }
   return realFetch(input, options);
 };
@@ -392,6 +408,8 @@ async function shutdown() {
     console.error(`agent-host: 关闭时释放会话失败 ${error?.message || error}`);
   }
   await new Promise((resolve) => server.close(() => resolve()));
+  // 账本是异步写入，退出前必须等它落盘，否则最后几行会丢。
+  await ledgerWrite.catch(() => {});
   process.exit(0);
 }
 process.once('SIGTERM', () => { void shutdown(); });
