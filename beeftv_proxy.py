@@ -51,12 +51,18 @@ log = logging.getLogger("beeftv-proxy")
 # ── Configuration ────────────────────────────────────────────────────────────────
 COMFY_HOST = os.environ.get("BEEFTV_DGX_COMFY", "http://192.168.1.193:8188")
 PORT = int(os.environ.get("BEEFTV_PROXY_PORT", "8198"))
-# Listen on both IPv4 and IPv6 so Go's `localhost` lookup (which prefers ::1)
-# can reach us without falling through to v4 after a refused connection.
-LISTEN = os.environ.get("BEEFTV_PROXY_LISTEN", "::")
-# The base URL handed back to the browser for generated media. Override when the
+# Listen address. macOS default to IPv4: a "::" dual-stack listener can refuse
+# IPv4 connections (curl http://127.0.0.1:8198/health -> Connection refused)
+# once the asyncio task pool is saturated.
+LISTEN = os.environ.get("BEEFTV_PROXY_LISTEN", "0.0.0.0")
+# The base URL handed back to callers for generated media. Override when the
 # BeefTV web app is opened from a machine other than this one.
-PUBLIC_BASE = os.environ.get("BEEFTV_PROXY_PUBLIC_BASE", f"http://localhost:{PORT}")
+#
+# Must be an IPv4 literal, NOT "localhost": Go resolves "localhost" to ::1
+# first, and the backend then fails with
+#   dial tcp [::1]:8198: connect: connection refused
+# when it downloads the media URL we hand back.
+PUBLIC_BASE = os.environ.get("BEEFTV_PROXY_PUBLIC_BASE", f"http://127.0.0.1:{PORT}")
 # Shared secret for proxy authentication. If set, every /v1/* request must carry
 # this value in the X-Beeftv-Token header. Leave blank to disable (dev only).
 PROXY_TOKEN = os.environ.get("BEEFTV_PROXY_TOKEN", "")

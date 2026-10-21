@@ -2,6 +2,7 @@ package modelcatalog
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"infinite-canvas/backend/internal/beefapi"
@@ -353,6 +354,28 @@ func ChannelAPIFormatForProtocol(channelDefault string, protocol model.ChannelIn
 // Returns (result, true) when the ID was a local model format and was handled.
 // Returns (nil, false) when the ID is not a local model format and normal
 // hosted-model processing should continue.
+// LocalProxyBaseURLEnv overrides where local channels reach beeftv_proxy.py.
+const LocalProxyBaseURLEnv = "CANVAS_LOCAL_PROXY_BASE_URL"
+
+// DefaultLocalProxyBaseURL is an IPv4 literal on purpose: beeftv_proxy.py binds
+// 0.0.0.0 only, so "localhost" resolves to ::1 first and every call is refused.
+const DefaultLocalProxyBaseURL = "http://127.0.0.1:8198"
+
+// localProxyBaseURL returns the configured local proxy endpoint, falling back to
+// the IPv4-safe default. Trailing slashes are trimmed so callers can append paths.
+func localProxyBaseURL() string {
+	configured := strings.TrimSpace(os.Getenv(LocalProxyBaseURLEnv))
+	if configured == "" {
+		return DefaultLocalProxyBaseURL
+	}
+	return strings.TrimRight(configured, "/")
+}
+
+// resolveLocalModelSelection hydrates the config with the local proxy endpoint.
+// It hydrates the config with the proxy base URL so execution can proceed.
+// Returns (result, true) when the ID was a local model format and was handled.
+// Returns (nil, false) when the ID is not a local model format and normal
+// hosted-model processing should continue.
 func resolveLocalModelSelection(logicalModelID string, input map[string]any, taskType string, operation string) (map[string]any, bool) {
 	// Only handle IDs that contain "::" — the local model format.
 	// Hosted logical model IDs will be handled by the normal route below.
@@ -368,30 +391,36 @@ func resolveLocalModelSelection(logicalModelID string, input map[string]any, tas
 	modelKey := strings.TrimSpace(parts[1])
 
 	// Determine the proxy base URL and interface type from the channel ID.
-	// Local channels use localhost:8198 (the beeftv_proxy.py on the Mac).
+	// Local channels all point at the local beeftv_proxy.py.
+	//
+	// The default must be an IPv4 literal, NOT "localhost": beeftv_proxy.py binds
+	// 0.0.0.0 (IPv4 only), while Go's resolver prefers ::1 for "localhost", so a
+	// localhost base URL fails with "dial tcp [::1]:8198: connection refused" and
+	// every local generation dies at the network layer. Override with
+	// CANVAS_LOCAL_PROXY_BASE_URL when the proxy is served elsewhere.
 	var baseURL string
 	var apiFormat string
 
 	switch channelID {
 	case "dgx-flux-local", "dgx-sdxl-local":
 		// DGX Spark image generation: FLUX / SDXL via ComfyUI
-		baseURL = "http://localhost:8198"
+		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
-	case "minimax-h3-local":
-		// MiniMax H3 text-to-video on DGX Spark ComfyUI
-		baseURL = "http://localhost:8198"
+	case "minimax-h3-local", "dgx-minimax-local", "dgx-wan-local":
+		// MiniMax H3 / Wan 2.1 text-to-video on DGX Spark ComfyUI
+		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
 	case "dgx-deepseek-local":
 		// DeepSeek R1 long-context text on DGX Spark
-		baseURL = "http://localhost:8198"
+		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
 	case "mac-ollama-local":
 		// Ollama on Mac Studio for local text
-		baseURL = "http://localhost:8198"
+		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
 	case "mac-piper-local":
 		// Piper TTS on Mac Studio for local audio
-		baseURL = "http://localhost:8198"
+		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
 	default:
 		// Unknown local channel — pass through and let execution fail with a clear error.

@@ -452,7 +452,7 @@ func TestResolveLocalModelSelection(t *testing.T) {
 			logicalModelID: "dgx-flux-local::flux-schnell",
 			taskType:       "canvas_image",
 			want:           true,
-			wantBaseURL:    "http://localhost:8198",
+			wantBaseURL:    DefaultLocalProxyBaseURL,
 			wantModel:      "flux-schnell",
 		},
 		{
@@ -460,7 +460,7 @@ func TestResolveLocalModelSelection(t *testing.T) {
 			logicalModelID: "minimax-h3-local::minimax-h3",
 			taskType:       "canvas_video",
 			want:           true,
-			wantBaseURL:    "http://localhost:8198",
+			wantBaseURL:    DefaultLocalProxyBaseURL,
 			wantModel:      "minimax-h3",
 		},
 		{
@@ -468,7 +468,7 @@ func TestResolveLocalModelSelection(t *testing.T) {
 			logicalModelID: "mac-piper-local::piper",
 			taskType:       "canvas_audio",
 			want:           true,
-			wantBaseURL:    "http://localhost:8198",
+			wantBaseURL:    DefaultLocalProxyBaseURL,
 			wantModel:      "piper",
 		},
 		{
@@ -476,7 +476,7 @@ func TestResolveLocalModelSelection(t *testing.T) {
 			logicalModelID: "mac-ollama-local::qwen3:8b",
 			taskType:       "canvas_text",
 			want:           true,
-			wantBaseURL:    "http://localhost:8198",
+			wantBaseURL:    DefaultLocalProxyBaseURL,
 			wantModel:      "qwen3:8b",
 		},
 		{
@@ -484,7 +484,7 @@ func TestResolveLocalModelSelection(t *testing.T) {
 			logicalModelID: "dgx-deepseek-local::deepseek-v4-flash",
 			taskType:       "canvas_text",
 			want:           true,
-			wantBaseURL:    "http://localhost:8198",
+			wantBaseURL:    DefaultLocalProxyBaseURL,
 			wantModel:      "deepseek-v4-flash",
 		},
 		{
@@ -560,7 +560,7 @@ func TestSelectTaskModelLocalIDBypassesFrontendEnabled(t *testing.T) {
 	if !ok {
 		t.Fatalf("input.config missing or wrong type: %T", result.Input["config"])
 	}
-	if baseURL, _ := cfg["baseUrl"].(string); baseURL != "http://localhost:8198" {
-		t.Fatalf("baseUrl = %q, want %q", baseURL, "http://localhost:8198")
+	if baseURL, _ := cfg["baseUrl"].(string); baseURL != DefaultLocalProxyBaseURL {
+		t.Fatalf("baseUrl = %q, want %q", baseURL, DefaultLocalProxyBaseURL)
 	}
 }
