@@ -139,6 +139,35 @@ func TestProxyRequestModelReadsMultipartField(t *testing.T) {
 	}
 }
 
+// 多部分表单里目标字段排在其它字段之后时也必须能取到，
+// 而且每个 part 都要被关闭：早退分支最容易漏掉 Close。
+func TestProxyRequestModelReadsLaterMultipartField(t *testing.T) {
+	var body strings.Builder
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("prompt", "a red apple")
+	_ = writer.WriteField("size", "1024x1024")
+	_ = writer.WriteField("model", "gpt-image-1")
+	_ = writer.Close()
+	if got := proxyRequestModel(writer.FormDataContentType(), []byte(body.String())); got != "gpt-image-1" {
+		t.Fatalf("proxyRequestModel() = %q", got)
+	}
+}
+
+func TestFirstMultipartFieldClosesEveryPart(t *testing.T) {
+	var body strings.Builder
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("other", "value")
+	_ = writer.WriteField("model", "gpt-image-1")
+	_ = writer.Close()
+	value, ok := firstMultipartField(writer.FormDataContentType(), []byte(body.String()), "model", 1024)
+	if !ok || value != "gpt-image-1" {
+		t.Fatalf("firstMultipartField() = %q, %v", value, ok)
+	}
+	if _, ok := firstMultipartField(writer.FormDataContentType(), []byte(body.String()), "missing", 1024); ok {
+		t.Fatal("missing field must report not found")
+	}
+}
+
 func TestAuthorizeSystemProxyRestrictsModelProtocol(t *testing.T) {
 	body := []byte(`{"model":"gpt-4.1"}`)
 	channel := &model.ModelChannel{APIFormat: "openai", ModelsJSON: `["gpt-4.1"]`}

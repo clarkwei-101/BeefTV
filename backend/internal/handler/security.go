@@ -275,21 +275,33 @@ func channelAllowsModel(channel *model.ModelChannel, requested string) bool {
 	return false
 }
 
-func proxyRequestModel(contentType string, body []byte) string {
+// firstMultipartField 取出 multipart 报文里的第一个指定字段。
+//
+// multipart.Part 必须被关闭，否则底层 reader 不会被释放；早退分支最容易
+// 漏掉 Close，所以统一由这个 helper 负责遍历与关闭，调用方只拿值。
+func firstMultipartField(contentType string, body []byte, name string, limit int64) (string, bool) {
 	mediaType, params, _ := mime.ParseMediaType(contentType)
-	if strings.HasPrefix(mediaType, "multipart/") {
-		reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
-		for {
-			part, err := reader.NextPart()
-			if err != nil {
-				return ""
-			}
-			if part.FormName() == "model" {
-				value, _ := io.ReadAll(io.LimitReader(part, 1024))
-				return strings.TrimSpace(string(value))
-			}
-			_ = part.Close()
+	if !strings.HasPrefix(mediaType, "multipart/") || params["boundary"] == "" {
+		return "", false
+	}
+	reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	for {
+		part, err := reader.NextPart()
+		if err != nil {
+			return "", false
 		}
+		if part.FormName() == name {
+			value, _ := io.ReadAll(io.LimitReader(part, limit))
+			_ = part.Close()
+			return strings.TrimSpace(string(value)), true
+		}
+		_ = part.Close()
+	}
+}
+
+func proxyRequestModel(contentType string, body []byte) string {
+	if value, ok := firstMultipartField(contentType, body, "model", 1024); ok {
+		return value
 	}
 	var payload map[string]interface{}
 	if json.Unmarshal(body, &payload) != nil {
@@ -310,20 +322,10 @@ func proxyRequestModelForPath(requestPath string, contentType string, body []byt
 }
 
 func proxyRequestVideoSeconds(contentType string, body []byte) int64 {
-	mediaType, params, _ := mime.ParseMediaType(contentType)
-	if strings.HasPrefix(mediaType, "multipart/") {
-		reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
-		for {
-			part, err := reader.NextPart()
-			if err != nil {
-				return 0
-			}
-			if part.FormName() == "seconds" || part.FormName() == "duration" {
-				value, _ := io.ReadAll(io.LimitReader(part, 32))
-				seconds, _ := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64)
-				return seconds
-			}
-			_ = part.Close()
+	for _, name := range []string{"seconds", "duration"} {
+		if value, ok := firstMultipartField(contentType, body, name, 32); ok {
+			seconds, _ := strconv.ParseInt(value, 10, 64)
+			return seconds
 		}
 	}
 	var payload map[string]any
