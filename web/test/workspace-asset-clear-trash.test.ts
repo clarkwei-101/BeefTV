@@ -11,6 +11,7 @@ import {
     workspaceClearTrashMessage,
 } from "@/services/workspace-asset-repository";
 import { peekAssetStoreDraft, recordAssetStoreDraft, resetAssetStoreDraftsForTests, useAssetStore, type Asset } from "@/stores/use-asset-store";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function switchScope(userId: string) {
     const previous = getActiveUserScope();
@@ -75,15 +76,6 @@ function deferred<T>() {
     return { promise, resolve, reject };
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 const spies: Array<{ mockRestore: () => void }> = [];
 
@@ -116,7 +108,7 @@ describe("clear workspace archived assets", () => {
             assets: [sampleAsset("live-1"), sampleAsset("live-2"), sampleAsset("arch-001", "archived")],
         });
         try {
-            const result = await withAdapter(async (config) => {
+            const result = await withIsolatedAdapter(async (config) => {
                 const url = String(config.url || "");
                 const method = String(config.method || "get").toLowerCase();
                 if (method === "get" && url.includes("/assets")) {
@@ -164,7 +156,7 @@ describe("clear workspace archived assets", () => {
         desktopBackend();
         const remaining = Array.from({ length: 125 }, (_, index) => `arch-${String(125 - index).padStart(3, "0")}`);
         try {
-            const result = await withAdapter(async (config) => {
+            const result = await withIsolatedAdapter(async (config) => {
                 const url = String(config.url || "");
                 const method = String(config.method || "get").toLowerCase();
                 if (method === "get") {
@@ -210,7 +202,7 @@ describe("clear workspace archived assets", () => {
         desktopBackend();
         const remaining = ["arch-002", "arch-001"];
         try {
-            await expect(withAdapter(async (config) => {
+            await expect(withIsolatedAdapter(async (config) => {
                 const url = String(config.url || "");
                 const method = String(config.method || "get").toLowerCase();
                 if (method === "get") {
@@ -245,7 +237,7 @@ describe("clear workspace archived assets", () => {
             markStarted = resolve;
         });
         try {
-            const run = withAdapter(async (config) => {
+            const run = withIsolatedAdapter(async (config) => {
                 const url = String(config.url || "");
                 const method = String(config.method || "get").toLowerCase();
                 if (method === "get") {
@@ -293,7 +285,7 @@ describe("clear workspace archived assets", () => {
             markStarted = resolve;
         });
         try {
-            const run = withAdapter(async (config) => {
+            const run = withIsolatedAdapter(async (config) => {
                 const url = String(config.url || "");
                 const method = String(config.method || "get").toLowerCase();
                 if (method === "get") {
@@ -338,7 +330,7 @@ describe("clear workspace archived assets", () => {
             ],
         });
         try {
-            const result = await withAdapter(async () => {
+            const result = await withIsolatedAdapter(async () => {
                 throw new Error("browser-local must not call the library API");
             }, async () => clearWorkspaceArchivedAssets());
             expect(result).toEqual({ deleted: 2, remaining: 0 });

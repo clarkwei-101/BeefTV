@@ -21,6 +21,7 @@ import { createDepthCaptureTask } from "@/services/api/depth-capture";
 import { createTimelineRenderTask, createTimelineTranscriptionTask } from "@/services/api/timeline-tasks";
 import type { GenerationTask } from "@/services/api/task-center";
 import type { TimelineProject } from "@/types/timeline";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -56,15 +57,6 @@ function envelope(data: unknown) {
     return { data: { code: 0, data, msg: "" }, status: 200, statusText: "OK", headers: {}, config: {} as never };
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 function requestPath(config: { url?: string }) {
     return String(config.url || "");
@@ -150,7 +142,7 @@ describe("local-executor typed HTTP contract", () => {
         const expectedScope = captureUserScope();
         const posts: Array<{ path: string; body: unknown }> = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 posts.push({ path: requestPath(config), body: config.data });
                 return envelope(generationTask({ id: "created", clientOperationId: (config.data as { clientOperationId?: string }).clientOperationId, status: "queued" }));
             }, async () => {
@@ -170,7 +162,7 @@ describe("local-executor typed HTTP contract", () => {
         const expectedScope = captureUserScope();
         const seen: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = requestPath(config);
                 seen.push(`${config.method}:${path}`);
                 if (path === "/timeline/renders") {
@@ -224,7 +216,7 @@ describe("local-executor submit and attach ownership", () => {
         let attached = 0;
         let created = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 entered.resolve();
                 await gate.promise;
                 created += 1;
@@ -272,7 +264,7 @@ describe("local-executor submit and attach ownership", () => {
         let attached = 0;
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = requestPath(config);
                 urls.push(path);
                 if (path === "/depth-captures") {
@@ -339,7 +331,7 @@ describe("local-executor submit and attach ownership", () => {
         const controller = new AbortController();
         let dispatched = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = requestPath(config);
                 if (path === "/timeline/transcriptions") {
                     return envelope(generationTask({ id: "tr-1", type: "timeline_transcription", status: "running", clientOperationId: "op-tr" }));
@@ -392,7 +384,7 @@ describe("local-executor submit and attach ownership", () => {
         const posts: string[] = [];
         let renderPosts = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = requestPath(config);
                 if (path === "/timeline/renders") {
                     const operationId = String(requestBody(config)?.clientOperationId || "");
@@ -482,7 +474,7 @@ describe("local-executor submit and attach ownership", () => {
         const posts: string[] = [];
         const frozenInputKey = localExecutorFrozenInputKey(["timeline_render", "proj-a", timeline]);
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = requestPath(config);
                 if (path === "/timeline/renders") {
                     const operationId = String(requestBody(config)?.clientOperationId || "");
@@ -545,7 +537,7 @@ describe("local-executor submit and attach ownership", () => {
         const editedTimeline = { ...timeline, durationMs: 2400 };
         const editedKey = localExecutorFrozenInputKey(["timeline_render", "proj-a", editedTimeline]);
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = requestPath(config);
                 if (path === "/timeline/renders") {
                     const body = requestBody(config);
@@ -615,7 +607,7 @@ describe("local-executor submit and attach ownership", () => {
         let attached = 0;
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = requestPath(config);
                 urls.push(path);
                 if (path === "/depth-captures") {

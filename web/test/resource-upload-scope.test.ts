@@ -10,6 +10,7 @@ import { apiClient, http } from "@/services/api/request";
 import { getResource, refreshResource, uploadResourceFile } from "@/services/api/resources";
 import { uploadImage } from "@/services/image-storage";
 import * as blobCache from "@/services/resource-blob-cache";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -31,15 +32,6 @@ function envelope(resource: { id: string }) {
     return { code: 0, msg: "", data: { resource: { id: resource.id, kind: "image", status: "ready", publicUrl: "", size: 1, mimeType: "image/png" } } };
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 describe("HTTP expectedScope dispatch", () => {
     test("does not return an in-flight result after A to B to A", async () => {
@@ -48,7 +40,7 @@ describe("HTTP expectedScope dispatch", () => {
         const entered = deferred();
         const gate = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 entered.resolve();
                 await gate.promise;
                 return { data: { code: 0, data: { assets: [] }, msg: "" }, status: 200, statusText: "OK", headers: {}, config };
@@ -69,7 +61,7 @@ describe("HTTP expectedScope dispatch", () => {
         setActiveUserScope("owner-b");
         let sent = 0;
         try {
-            await withAdapter(async () => {
+            await withIsolatedAdapter(async () => {
                 sent += 1;
                 return { data: { code: 0, data: { ok: true }, msg: "" }, status: 200, statusText: "OK", headers: {}, config: {} as never };
             }, async () => {
@@ -89,7 +81,7 @@ describe("resource upload scope", () => {
         const gate = deferred();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(String(config.url || ""));
                 entered.resolve();
                 await gate.promise;
@@ -127,7 +119,7 @@ describe("resource upload scope", () => {
         const urls: string[] = [];
         const size = 51 * 1024 * 1024;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(String(config.url || ""));
                 if (config.url === "/resources/uploads") {
                     entered.resolve();
@@ -159,7 +151,7 @@ describe("resource upload scope", () => {
         const urls: string[] = [];
         const size = 51 * 1024 * 1024;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(String(config.url || ""));
                 if (config.url === "/resources/uploads") {
                     throw new axios.AxiosError("rate limited", "ERR_BAD_REQUEST", config, undefined, {
@@ -195,7 +187,7 @@ describe("resource lookup scope", () => {
         const gate = deferred();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(String(config.url || ""));
                 entered.resolve();
                 await gate.promise;
@@ -210,7 +202,7 @@ describe("resource lookup scope", () => {
             });
             await expect(getResource("res-lookup-aba", { expectedScope: expectedA })).rejects.toBeInstanceOf(UserScopeAbandonedError);
             let followUp = 0;
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 followUp += 1;
                 return { data: envelope({ id: "res-lookup-aba" }), status: 200, statusText: "OK", headers: {}, config };
             }, async () => {
@@ -232,7 +224,7 @@ describe("resource lookup scope", () => {
         const otherEntered = deferred();
         let requests = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 requests += 1;
                 if (requests === 1) {
                     firstEntered.resolve();
@@ -267,7 +259,7 @@ describe("resource lookup scope", () => {
         const entered = deferred();
         const gate = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 entered.resolve();
                 await gate.promise;
                 throw new axios.AxiosError("not found", "ERR_BAD_REQUEST", config, undefined, {
@@ -296,7 +288,7 @@ describe("resource lookup scope", () => {
         const expectedA = userScopeGuard.captureUserScope();
         let requests = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 requests += 1;
                 return { data: envelope({ id: "res-stale-cache" }), status: 200, statusText: "OK", headers: {}, config };
             }, async () => {
@@ -320,7 +312,7 @@ describe("resource lookup scope", () => {
         const controller = new AbortController();
         let requests = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 requests += 1;
                 return { data: envelope({ id: "res-cached-abort" }), status: 200, statusText: "OK", headers: {}, config };
             }, async () => {
@@ -340,7 +332,7 @@ describe("resource lookup scope", () => {
         const expectedA = userScopeGuard.captureUserScope();
         let requests = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 requests += 1;
                 throw new axios.AxiosError("not found", "ERR_BAD_REQUEST", config, undefined, {
                     data: { code: 404, data: null, msg: "not found" },
@@ -375,7 +367,7 @@ describe("resource lookup scope", () => {
         const secondGate = deferred();
         let requests = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 requests += 1;
                 const n = requests;
                 if (n === 1) {
@@ -411,7 +403,7 @@ describe("resource lookup scope", () => {
         const entered = deferred();
         const gate = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 entered.resolve();
                 await gate.promise;
                 return { data: envelope({ id: "res-refresh-aba" }), status: 200, statusText: "OK", headers: {}, config };
@@ -441,7 +433,7 @@ describe("uploadImage delayed promises", () => {
         let uploaded = 0;
         globalThis.fetch = (async () => fetchGate.promise) as typeof fetch;
         try {
-            await withAdapter(async () => {
+            await withIsolatedAdapter(async () => {
                 uploaded += 1;
                 return { data: envelope({ id: "res-fetch" }), status: 200, statusText: "OK", headers: {}, config: {} as never };
             }, async () => {
@@ -470,7 +462,7 @@ describe("uploadImage delayed promises", () => {
         const prime = spyOn(blobCache, "primeResourceBlobCache");
         let uploaded = 0;
         try {
-            await withAdapter(async () => {
+            await withIsolatedAdapter(async () => {
                 uploaded += 1;
                 return { data: envelope({ id: "res-decode" }), status: 200, statusText: "OK", headers: {}, config: {} as never };
             }, async () => {
@@ -497,7 +489,7 @@ describe("uploadImage delayed promises", () => {
         const decode = spyOn(imageUtils, "readImageMeta").mockResolvedValue({ width: 8, height: 8, mimeType: "image/png" });
         const prime = spyOn(blobCache, "primeResourceBlobCache").mockResolvedValue("");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 await uploadGate.promise;
                 return { data: envelope({ id: "res-cache" }), status: 200, statusText: "OK", headers: {}, config };
             }, async () => {

@@ -17,6 +17,7 @@ import {
     type Asset,
 } from "@/stores/use-asset-store";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -67,15 +68,6 @@ function httpError(config: { url?: string }, status: number, msg: string) {
     });
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 const spies: Array<{ mockRestore: () => void }> = [];
 
@@ -150,7 +142,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         desktopBackend();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 if (String(config.method).toLowerCase() === "put") {
                     return envelope({ asset: { id: requestAssetID(config), title: "图片", category: "material", status: "confirmed", createdAt: "2026-10-02T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" } });
@@ -184,7 +176,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         const gate = deferred();
         let puts = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "put") {
                     puts += 1;
                     entered.resolve();
@@ -213,7 +205,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         const firstGate = deferred();
         const puts: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "put") {
                     puts.push(getActiveUserScope());
                     if (puts.length === 1) {
@@ -246,7 +238,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         desktopBackend();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 throw httpError(config, 403, "没有权限");
             }, async () => {
@@ -269,7 +261,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         desktopBackend();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 throw httpError(config, 409, "素材冲突");
             }, async () => {
@@ -302,7 +294,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         desktopBackend();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 if (String(config.method).toLowerCase() === "put") {
                     return envelope({ asset: { id: requestAssetID(config), title: "图片", createdAt: "2026-10-02T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" } });
@@ -331,7 +323,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         const urls: string[] = [];
         let puts = 0;
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 if (String(config.method).toLowerCase() === "put") {
                     puts += 1;
@@ -372,7 +364,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         const waitGate = deferred();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 throw httpError(config, 429, "请求过于频繁，请稍后重试");
             }, async () => {
@@ -404,7 +396,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         const urls: string[] = [];
         try {
             await withDurableDraftMemory(async () => {
-                await withAdapter(async (config) => {
+                await withIsolatedAdapter(async (config) => {
                     urls.push(requestKey(config));
                     return envelope({ asset: { id: "unexpected" } });
                 }, async () => {
@@ -468,7 +460,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
             },
         };
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id: "unexpected" } });
             }, async () => {
@@ -493,7 +485,7 @@ describe("ensureCanvasNodeAsset scope and canonical writes", () => {
         browserLocal();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id: "unexpected" } });
             }, async () => {

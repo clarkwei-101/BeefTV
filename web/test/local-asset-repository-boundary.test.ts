@@ -8,6 +8,7 @@ import { apiClient } from "@/services/api/request";
 import * as localWorkspaceSync from "@/services/local-workspace-sync";
 import { persistWorkspaceAssetChanges, persistWorkspaceAssetLink, deleteWorkspaceAsset, resetWorkspaceAssetCommitStateForTests } from "@/services/workspace-asset-repository";
 import { resetAssetStoreDraftsForTests, useAssetStore, type Asset } from "@/stores/use-asset-store";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -46,15 +47,6 @@ function envelope(data: unknown, status = 200) {
     return { data: { code: 0, msg: "", data }, status, statusText: "OK", headers: {}, config: {} as never };
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 const spies: Array<{ mockRestore: () => void }> = [];
 
@@ -88,7 +80,7 @@ describe("workspace asset repository runtime boundary", () => {
         const urls: string[] = [];
         useAssetStore.setState({ assets: [sampleAsset()] });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(`${config.method || "get"} ${String(config.url || "")}`);
                 return envelope({});
             }, async () => {
@@ -112,7 +104,7 @@ describe("workspace asset repository runtime boundary", () => {
         const asset = sampleAsset();
         useAssetStore.setState({ assets: [asset] });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(`${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`);
                 if (String(config.url || "").includes("/assets/asset-1") && String(config.method).toLowerCase() === "put") {
                     return envelope({ asset: { id: "asset-1", title: "画布图片", category: "material", status: "confirmed", createdAt: asset.createdAt, updatedAt: asset.updatedAt } });
@@ -141,7 +133,7 @@ describe("workspace asset repository runtime boundary", () => {
         const asset = sampleAsset();
         useAssetStore.setState({ assets: [asset] });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(`${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`);
                 return envelope({ asset: { id: "asset-1", title: "画布图片", category: "material", status: "confirmed", createdAt: asset.createdAt, updatedAt: asset.updatedAt } });
             }, async () => {
@@ -174,7 +166,7 @@ describe("workspace asset repository runtime boundary", () => {
         };
         useAssetStore.setState({ assets: [asset] });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(`${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`);
                 expect((config.params || {}) as Record<string, unknown>).not.toHaveProperty("expectedStatus");
                 return envelope({ id: "asset-1" });
@@ -206,7 +198,7 @@ describe("workspace asset repository runtime boundary", () => {
         };
         useAssetStore.setState({ assets: [asset] });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 throw new axios.AxiosError("没有权限", "ERR_BAD_REQUEST", config, undefined, {
                     data: { code: 403, data: null, msg: "没有权限" },
                     status: 403,
@@ -239,7 +231,7 @@ describe("workspace asset repository runtime boundary", () => {
                 source: "手动添加",
                 data: { content: "hello" },
             });
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(`${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`);
                 return envelope({ asset: { id, title: "草稿", createdAt: "2026-10-02T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" } });
             }, async () => {
@@ -262,7 +254,7 @@ describe("workspace asset repository runtime boundary", () => {
         const asset = sampleAsset();
         useAssetStore.setState({ assets: [asset] });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(`${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`);
                 entered.resolve();
                 await gate.promise;

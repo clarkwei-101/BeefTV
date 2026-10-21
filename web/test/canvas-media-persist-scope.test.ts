@@ -15,6 +15,7 @@ import { captureUserScope, UserScopeAbandonedError, type CapturedUserScope } fro
 import { apiClient } from "@/services/api/request";
 import type { GenerationTask } from "@/services/api/task-center";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -65,15 +66,6 @@ function envelope(data: unknown) {
     return { data: { code: 0, data, msg: "" }, status: 200, statusText: "OK", headers: {}, config: {} as never };
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 function generationTask(partial: Partial<GenerationTask> & Pick<GenerationTask, "id">): GenerationTask {
     return {
@@ -374,7 +366,7 @@ describe("recoverOwnedDepthCaptureNodes ownership", () => {
         const urls: string[] = [];
         const node = depthNode("depth-1");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = String(config.url || "");
                 urls.push(`${config.method}:${path}`);
                 if (path === "/tasks/depth-task") {
@@ -433,7 +425,7 @@ describe("recoverOwnedDepthCaptureNodes ownership", () => {
         let persistCalls = 0;
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = String(config.url || "");
                 urls.push(`${config.method}:${path}`);
                 if (path === "/tasks/depth-task") {
@@ -482,7 +474,7 @@ describe("recoverOwnedDepthCaptureNodes ownership", () => {
         const nodeWrites: string[] = [];
         const node = depthNode("depth-1");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 const path = String(config.url || "");
                 if (path === "/tasks/depth-task") {
                     return envelope(generationTask({

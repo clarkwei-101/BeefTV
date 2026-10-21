@@ -13,6 +13,7 @@ import {
     WORKSPACE_ASSET_FOLDERS_KEY,
 } from "@/services/workspace-asset-folders";
 import { resetAssetStoreDraftsForTests, useAssetStore, type Asset } from "@/stores/use-asset-store";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function switchScope(userId: string) {
     const previous = getActiveUserScope();
@@ -28,15 +29,6 @@ function requestKey(config: { method?: string; url?: string }) {
     return `${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`;
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 const spies: Array<{ mockRestore: () => void }> = [];
 
@@ -87,7 +79,7 @@ describe("workspace asset folders", () => {
             return value;
         });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({});
             }, async () => {
@@ -115,7 +107,7 @@ describe("workspace asset folders", () => {
         desktopBackend();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 const method = String(config.method || "get").toLowerCase();
                 const url = String(config.url || "");
@@ -150,7 +142,7 @@ describe("workspace asset folders", () => {
         const urls: string[] = [];
         useAssetStore.setState({ assets: [textAsset("asset-1")] });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 if (String(config.url || "") === "/assets/folder") {
                     return envelope({ assetIds: ["asset-1"], folderId: "folder-1" });

@@ -7,6 +7,7 @@ import { getActiveUserScope, setActiveUserScope } from "@/lib/user-scope";
 import { captureUserScope, UserScopeAbandonedError } from "@/lib/user-scope-guard";
 import { apiClient } from "@/services/api/request";
 import { deleteWorkspaceAsset, persistWorkspaceAssetChanges, persistWorkspaceAssetLink, resetWorkspaceAssetCommitStateForTests } from "@/services/workspace-asset-repository";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 import {
     flushAssetStorePersistence,
     hydrateAssetStoreDrafts,
@@ -74,15 +75,6 @@ async function waitFor(predicate: () => boolean, label: string) {
     }
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 const spies: Array<{ mockRestore: () => void }> = [];
 
@@ -106,7 +98,7 @@ describe("asset store draft commit identity", () => {
             useAssetStore.setState({ assets: [textAsset("asset-receipt")] });
             try {
                 useAssetStore.getState().updateAsset("asset-receipt", { title: "保留修改" });
-                await withAdapter(async () => envelope(receipt), async () => {
+                await withIsolatedAdapter(async () => envelope(receipt), async () => {
                     await expect(persistWorkspaceAssetChanges(captureUserScope())).rejects.toThrow("素材保存回执无效");
                 });
                 expect(peekAssetStoreDraft("owner-a", "asset-receipt")?.kind).toBe("upsert");
@@ -123,7 +115,7 @@ describe("asset store draft commit identity", () => {
         try {
             useAssetStore.getState().updateAsset("asset-1", { title: "已改" });
             await useAssetStore.getState().removeAsset("asset-1");
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ id: "asset-1" });
             }, async () => {
@@ -154,7 +146,7 @@ describe("asset store draft commit identity", () => {
                 source: "手动添加",
                 data: { content: "v1" },
             });
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 const payload = typeof config.data === "string" ? JSON.parse(config.data) : config.data;
                 if (payload?.asset?.title) titles.push(payload.asset.title);
@@ -196,7 +188,7 @@ describe("asset store draft commit identity", () => {
                 source: "手动添加",
                 data: { content: "x" },
             });
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 if (String(config.method).toLowerCase() === "put") {
                     entered.resolve();
@@ -243,7 +235,7 @@ describe("asset store draft commit identity", () => {
             expect(secondEpoch.epoch).not.toBe(firstEpoch.epoch);
             expect(peekAssetStoreDraft("owner-a", id)?.kind).toBe("upsert");
             expect(urls).toEqual([]);
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id, title: "未提交", createdAt: "2026-10-02T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" } });
             }, async () => {
@@ -289,7 +281,7 @@ describe("asset store draft commit identity", () => {
             useAssetStore.setState({ assets: [asset] });
             await hydrateAssetStoreDrafts("owner-a");
             expect(peekAssetStoreDraft("owner-a", id)?.kind).toBe("upsert");
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id, title: asset.title, createdAt: asset.createdAt, updatedAt: asset.updatedAt } });
             }, async () => {
@@ -314,7 +306,7 @@ describe("asset store draft commit identity", () => {
             const asset = textAsset("asset-live", "原标题");
             useAssetStore.setState({ assets: [asset] });
             useAssetStore.getState().updateAsset("asset-live", { title: "提交中" });
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 entered.resolve();
                 await gate.promise;
                 return envelope({ asset: { id: "asset-live", title: "服务端旧名", category: "other", status: "confirmed", createdAt: asset.createdAt, updatedAt: asset.updatedAt } });
@@ -392,7 +384,7 @@ describe("asset store draft commit identity", () => {
             expect(peekAssetStoreDraft("owner-a", id)?.kind).toBe("upsert");
             expect(peekAssetStoreDraft("owner-a", id)?.asset?.title).toBe("编辑后");
 
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 const payload = typeof config.data === "string" ? JSON.parse(config.data) : config.data;
                 if (payload?.asset?.title) titles.push(payload.asset.title);
@@ -433,7 +425,7 @@ describe("asset store draft commit identity", () => {
         try {
             unloadAssetStoreDraftsForTests();
             const expected = captureUserScope();
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id: "x" } });
             }, async () => {
@@ -475,7 +467,7 @@ describe("asset store draft commit identity", () => {
         try {
             unloadAssetStoreDraftsForTests();
             const expected = captureUserScope();
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ id: "asset-1" });
             }, async () => {

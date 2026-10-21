@@ -12,6 +12,7 @@ import * as imageStorage from "@/services/image-storage";
 import * as localWorkspaceSync from "@/services/local-workspace-sync";
 import { persistWorkspaceAssetChanges, resetWorkspaceAssetCommitStateForTests } from "@/services/workspace-asset-repository";
 import { hydrateAssetStoreDrafts, peekAssetStoreDraft, resetAssetStoreDraftsForTests, unloadAssetStoreDraftsForTests, useAssetStore, type ImageAsset, type NewAsset } from "@/stores/use-asset-store";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -64,15 +65,6 @@ function requestKey(config: { method?: string; url?: string }) {
     return `${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`;
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 const spies: Array<{ mockRestore: () => void }> = [];
 
@@ -100,7 +92,7 @@ describe("director library persist canonical writes", () => {
         const remote = spyOn(localWorkspaceSync, "saveRemoteUserDataNow");
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 const id = String(config.url || "").split("/").pop();
                 return envelope({ asset: { id, title: "全景图", category: "other", status: "confirmed", createdAt: "2026-10-02T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" } });
@@ -122,7 +114,7 @@ describe("director library persist canonical writes", () => {
         const restore = switchScope("owner-a");
         desktopBackend();
         try {
-            await withAdapter(async () => {
+            await withIsolatedAdapter(async () => {
                 throw new Error("disk full");
             }, async () => {
                 await expect(persistDirectorLibraryAsset({ asset: panoramaAsset(), expectedScope: captureUserScope() })).rejects.toThrow("disk full");
@@ -143,7 +135,7 @@ describe("director library persist canonical writes", () => {
         try {
             setActiveUserScope("owner-b");
             setActiveUserScope("owner-a");
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id: "unexpected" } });
             }, async () => {
@@ -170,7 +162,7 @@ describe("director library persist canonical writes", () => {
             return { storageKey: "image:panorama", url: "blob:panorama", width: 8, height: 8, bytes: 1, mimeType: "image/png" };
         });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id: "unexpected" } });
             }, async () => {
@@ -200,7 +192,7 @@ describe("director library persist canonical writes", () => {
         useAssetStore.setState({ assets: [cacheOnlyAsset()] });
         expect(peekAssetStoreDraft(getActiveUserScope(), "cache-only")).toBeUndefined();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 const id = String(config.url || "").split("/").pop();
                 return envelope({ asset: { id, title: "参考图", createdAt: "2026-10-02T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" } });
@@ -226,7 +218,7 @@ describe("director library persist canonical writes", () => {
         desktopBackend();
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 const id = String(config.url || "").split("/").pop();
                 return envelope({ asset: { id, title: "参考图", createdAt: "2026-10-02T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" } });
@@ -264,7 +256,7 @@ describe("director library persist canonical writes", () => {
             remoteUploadError: "资源服务暂时不可用",
         });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id: "unexpected" } });
             }, async () => {
@@ -301,7 +293,7 @@ describe("director library persist canonical writes", () => {
             memory.delete(String(key));
         });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({ asset: { id: "unexpected" } });
             }, async () => {
@@ -369,7 +361,7 @@ describe("director library persist canonical writes", () => {
         const remote = spyOn(localWorkspaceSync, "saveRemoteUserDataNow");
         const urls: string[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return envelope({});
             }, async () => {

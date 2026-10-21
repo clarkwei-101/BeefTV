@@ -26,6 +26,7 @@ import {
     type CanvasDrawingSnapshot,
 } from "@/lib/canvas/canvas-drawing-storage";
 import { apiClient } from "@/services/api/request";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -110,15 +111,6 @@ function drawingRecord(snapshot: unknown, revision: number, extras: Record<strin
     };
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 const spies: Array<{ mockRestore: () => void }> = [];
 const documents = new Map<string, unknown>();
@@ -167,7 +159,7 @@ describe("canvas drawing storage", () => {
         const preview = new Blob(["preview-v1"], { type: "image/png" });
         const renderBlob = new Blob(["render-v1"], { type: "image/png" });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources") && String(config.method).toLowerCase() === "post") {
                     return envelope({ resource: { id: "res-preview", status: "ready" } });
                 }
@@ -190,11 +182,11 @@ describe("canvas drawing storage", () => {
             expect(await previews.get("owner-a:p1:d1")?.text()).toBe("preview-v1");
             expect(await (renders.get("owner-a:p1:d1") as { blob: Blob } | undefined)?.blob.text()).toBe("render-v1");
 
-            const loaded = await withAdapter(async () => failure(500, "读失败"), async () => loadCanvasDrawing("p1", "d1", captureUserScope()).catch((error) => error));
+            const loaded = await withIsolatedAdapter(async () => failure(500, "读失败"), async () => loadCanvasDrawing("p1", "d1", captureUserScope()).catch((error) => error));
             expect(loaded).toBeInstanceOf(Error);
             expect((loaded as Error).message).toMatch(/读失败/);
 
-            const recovered = await withAdapter(async (config) => {
+            const recovered = await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "get" && String(config.url).includes("/drawings/")) return failure(404, "画板不存在");
                 throw new Error(`unexpected ${config.method} ${config.url}`);
             }, async () => loadCanvasDrawing("p1", "d1", captureUserScope()));
@@ -215,7 +207,7 @@ describe("canvas drawing storage", () => {
         let drawingPuts = 0;
         const snapshots: unknown[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put" && String(config.url).includes("/drawings/")) {
                     const body = requestBody(config) as { drawing: { revision: number; snapshot: unknown } };
@@ -267,7 +259,7 @@ describe("canvas drawing storage", () => {
         });
         try {
             const firstEpoch = captureUserScope();
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 puts.push(`${(config as { expectedScope?: { epoch: number } }).expectedScope?.epoch ?? "none"} ${String(config.method)} ${String(config.url)}`);
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-new", status: "ready" } });
                 return failure(500, "新纪元保存失败");
@@ -321,7 +313,7 @@ describe("canvas drawing storage", () => {
         });
         previews.set("owner-a:p1:d1", new Blob(["old-preview"], { type: "image/png" }));
         try {
-            const blob = await withAdapter(async (config) => {
+            const blob = await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "get" && String(config.url).includes("/drawings/d1")) {
                     return envelope(drawingRecord(snapshotOf("remote"), 4, { previewResourceId: "pv-new" }));
                 }
@@ -344,7 +336,7 @@ describe("canvas drawing storage", () => {
         desktopBackend();
         installStores();
         try {
-            const loaded = await withAdapter(async (config) => {
+            const loaded = await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "get" && String(config.url).includes("/drawings/d1")) {
                     return envelope(drawingRecord(snapshotOf("remote"), 4, { previewResourceId: "pv-1" }));
                 }
@@ -372,7 +364,7 @@ describe("canvas drawing storage", () => {
         installStores();
         documents.set("owner-a:p1:d1", { version: 2, engine: "excalidraw", snapshot: snapshotOf("stale"), revision: 9, updatedAt: "2026-10-01T00:00:00.000Z", shapeCount: 1, pageCount: 1 });
         try {
-            await withAdapter(async () => failure(503, "服务暂时不可用，请稍后重试"), async () => {
+            await withIsolatedAdapter(async () => failure(503, "服务暂时不可用，请稍后重试"), async () => {
                 await expect(loadCanvasDrawing("p1", "d1", captureUserScope())).rejects.toThrow(/服务暂时不可用/);
             });
         } finally {
@@ -385,7 +377,7 @@ describe("canvas drawing storage", () => {
         desktopBackend();
         installStores();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put" && String(config.url).includes("/drawings/")) {
                     return failure(409, "画板已有更新，已停止覆盖；请保留本地草稿并加载最新版本", "conflict");
@@ -409,7 +401,7 @@ describe("canvas drawing storage", () => {
         installStores();
         const puts: number[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     puts.push(1);
@@ -437,7 +429,7 @@ describe("canvas drawing storage", () => {
         installStores();
         const puts: number[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     puts.push(1);
@@ -449,14 +441,14 @@ describe("canvas drawing storage", () => {
                     .rejects.toBeInstanceOf(CanvasDrawingCanonicalMissingError);
             });
 
-            const loaded = await withAdapter(async (config) => {
+            const loaded = await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "get") return failure(404, "画板不存在");
                 throw new Error(`unexpected ${config.method} ${config.url}`);
             }, async () => loadCanvasDrawing("p1", "d1", captureUserScope()));
             expect(loaded?.snapshot).toEqual(snapshotOf("keep"));
             expect(loaded?.canonicalMissing).toBe(true);
 
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-2", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     puts.push(1);
@@ -486,7 +478,7 @@ describe("canvas drawing storage", () => {
         });
         const puts: number[] = [];
         try {
-            const loaded = await withAdapter(async (config) => {
+            const loaded = await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "get") return failure(404, "画板不存在");
                 throw new Error(`unexpected ${config.method} ${config.url}`);
             }, async () => loadCanvasDrawing("p1", "d1", captureUserScope()));
@@ -494,7 +486,7 @@ describe("canvas drawing storage", () => {
             expect(loaded?.snapshot).toEqual(snapshotOf("was-saved"));
             expect(loaded?.revision).toBe(3);
 
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "put") {
                     puts.push(1);
                     return envelope(drawingRecord(snapshotOf("resurrected"), 1));
@@ -517,7 +509,7 @@ describe("canvas drawing storage", () => {
         const staleGet = deferred();
         const gate = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "get") {
                     staleGet.resolve();
                     await gate.promise;
@@ -564,7 +556,7 @@ describe("canvas drawing storage", () => {
         void previousSet;
         const snapshots: unknown[] = [];
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     snapshots.push(requestBody(config).drawing?.snapshot);
@@ -596,7 +588,7 @@ describe("canvas drawing storage", () => {
         const enteredPut = deferred();
         const releasePut = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     const body = requestBody(config) as { drawing: { snapshot: unknown } };
@@ -637,7 +629,7 @@ describe("canvas drawing storage", () => {
         const enteredDelete = deferred();
         const releaseDelete = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     return envelope(drawingRecord(requestBody(config).drawing?.snapshot, 2));
@@ -683,7 +675,7 @@ describe("canvas drawing storage", () => {
             },
         });
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") return failure(500, "工作区暂时无法保存");
                 throw new Error(`unexpected ${config.method} ${config.url}`);
@@ -704,7 +696,7 @@ describe("canvas drawing storage", () => {
                 expect(cached.draft?.document.snapshot).toEqual(snapshotOf("second"));
                 expect(await previews.get("owner-a:p1:d1")?.text()).toBe("blob-b");
 
-                const recovered = await withAdapter(async (config) => {
+                const recovered = await withIsolatedAdapter(async (config) => {
                     if (String(config.method).toLowerCase() === "get" && String(config.url).includes("/drawings/")) return failure(404, "画板不存在");
                     throw new Error(`unexpected ${config.method} ${config.url}`);
                 }, async () => loadCanvasDrawing("p1", "d1", captureUserScope()));
@@ -723,7 +715,7 @@ describe("canvas drawing storage", () => {
         const enteredGet = deferred();
         const releaseGet = deferred();
         try {
-            const loading = withAdapter(async (config) => {
+            const loading = withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "get" && String(config.url).includes("/drawings/")) {
                     enteredGet.resolve();
                     await releaseGet.promise;
@@ -733,7 +725,7 @@ describe("canvas drawing storage", () => {
             }, async () => loadCanvasDrawing("p1", "d1", captureUserScope()));
 
             await enteredGet.promise;
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-new", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") return envelope(drawingRecord(snapshotOf("fresh"), 4));
                 throw new Error(`unexpected ${config.method} ${config.url}`);
@@ -786,7 +778,7 @@ describe("canvas drawing storage", () => {
         } as never;
         const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 methods.push(`${String(config.method).toLowerCase()} ${String(config.url)}`);
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") return failure(500, "工作区暂时无法保存");
@@ -815,7 +807,7 @@ describe("canvas drawing storage", () => {
         installStores();
         const key = drawingCacheKey("owner-a");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     const body = requestBody(config) as { drawing: { snapshot: unknown; revision: number } };
@@ -844,7 +836,7 @@ describe("canvas drawing storage", () => {
         installStores();
         const key = drawingCacheKey("owner-a");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") return failure(500, "工作区暂时无法保存");
                 throw new Error(`unexpected ${config.method} ${config.url}`);
@@ -867,7 +859,7 @@ describe("canvas drawing storage", () => {
         installStores();
         const key = drawingCacheKey("owner-a");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") throw new Error("网络中断");
                 throw new Error(`unexpected ${config.method} ${config.url}`);
@@ -896,7 +888,7 @@ describe("canvas drawing storage", () => {
         const enteredSecond = deferred();
         const releaseSecond = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     const body = requestBody(config) as { drawing: { snapshot: unknown; revision: number } };
@@ -943,7 +935,7 @@ describe("canvas drawing storage", () => {
         const enteredSecond = deferred();
         const releaseSecond = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     const body = requestBody(config) as { drawing: { snapshot: unknown; revision: number } };
@@ -988,7 +980,7 @@ describe("canvas drawing storage", () => {
         const otherScope = drawingCacheKey("owner-b");
         const dropped = drawingCacheKey("owner-a");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     const body = requestBody(config) as { drawing: { snapshot: unknown; revision: number } };
@@ -1035,7 +1027,7 @@ describe("canvas drawing storage", () => {
         });
         const key = drawingCacheKey("owner-a");
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     const body = requestBody(config) as { drawing: { snapshot: unknown; revision: number } };
@@ -1082,7 +1074,7 @@ describe("canvas drawing storage", () => {
         });
         const puts: string[] = [];
         try {
-            const loaded = await withAdapter(async (config) => {
+            const loaded = await withIsolatedAdapter(async (config) => {
                 if (String(config.method).toLowerCase() === "put") {
                     puts.push(`${config.method} ${config.url}`);
                     throw new Error("legacy load must not PUT");
@@ -1118,7 +1110,7 @@ describe("canvas drawing storage", () => {
         const enteredFirst = deferred();
         const releaseFirst = deferred();
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 if (String(config.url).includes("/resources")) return envelope({ resource: { id: "res-1", status: "ready" } });
                 if (String(config.method).toLowerCase() === "put") {
                     const body = requestBody(config) as { drawing: { snapshot: unknown; revision: number } };

@@ -15,6 +15,7 @@ import * as assetSync from "@/services/project-asset-sync";
 import { resetWorkspaceAssetCommitStateForTests } from "@/services/workspace-asset-repository";
 import { peekAssetStoreDraft, resetAssetStoreDraftsForTests, useAssetStore } from "@/stores/use-asset-store";
 import { CanvasNodeType, type CanvasNodeData } from "@/types/canvas";
+import { withIsolatedAdapter } from "./helpers/isolated-adapter";
 
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
@@ -78,15 +79,6 @@ function requestKey(config: { method?: string; url?: string }) {
     return `${String(config.method || "get").toLowerCase()} ${String(config.url || "")}`;
 }
 
-async function withAdapter<T>(adapter: NonNullable<typeof apiClient.defaults.adapter>, run: () => Promise<T>) {
-    const previous = apiClient.defaults.adapter;
-    apiClient.defaults.adapter = adapter;
-    try {
-        return await run();
-    } finally {
-        apiClient.defaults.adapter = previous;
-    }
-}
 
 afterEach(async () => {
     while (spies.length) spies.pop()?.mockRestore();
@@ -246,7 +238,7 @@ describe("director cover and output captured scope", () => {
             return { storageKey: "image:output", url: "blob:output", width: 8, height: 8, bytes: 1, mimeType: "image/png", pendingRemoteUpload: true };
         }));
         try {
-            await withAdapter(async (config) => {
+            await withIsolatedAdapter(async (config) => {
                 urls.push(requestKey(config));
                 return { data: { code: 0, msg: "", data: { asset: { id: "unexpected" } } }, status: 200, statusText: "OK", headers: {}, config: {} as never };
             }, async () => {
