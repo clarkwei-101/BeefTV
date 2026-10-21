@@ -193,6 +193,147 @@ postinstall 步骤。
   的 `/Users/yahweh/.../.local/project-workbench-debug`），留给用户在
   想要真正开源 / 多机分享时一次性整仓提交。
 
+## 补充二：`bun test` 全量跑挂掉的真因（本机磁盘写满 + 两个跨文件污染源）
+
+> **重要更正**：这一节最初把 `bun test` 全量跑挂掉归因为"磁盘写满"，
+> 那是**真因之一但不完整**。真正需要修的是**跨文件污染**：
+> `bun test` 把所有测试文件塞进**同一个 Bun 进程**，
+> 而项目自带的 `web/scripts/run-test-suite.mjs` 才是正确的入口
+> （它把带 `mock.module(` 的文件**单独起进程**跑）。
+> 直接 `bun test` 会让一个文件的 mock 漏给后面的文件。
+>
+> **正确命令是 `cd web && bun run test`（走 `scripts/run-test-suite.mjs`），
+> 不是 `bun test`。**
+
+### 2.1 现象
+
+- 直接 `bun test` 跑到第 38 个文件
+  `test/canvas-archive-sqlite-restore.test.ts` 时进程被杀
+  （exit 133 / SIGTRAP）。
+- 换用 `bun run test` 后进度停在
+  `test/canvas-batch-node-animation.test.tsx`（该文件**在 `main` 上同样卡死**，
+  属于既有问题，见 2.4）。
+- 而 `canvas-archive-sqlite-restore.test.ts` **单独跑 3 pass 0 fail**、
+  **按文件逐个跑 40 个文件全绿**。
+
+### 2.2 跨文件污染源 A：`globalThis.fetch` 被替换后不还原（**已修**）
+
+**根因**：`test/canvas-agent-assistant-stream.test.ts` 在
+`installFetch()` 里整体替换 `globalThis.fetch`，
+返回 `new Response("{}")` 作为兜底，但**文件结束时没有还原**。
+同进程内后续跑 `canvas-archive-sqlite-restore.test.ts` 时，
+它要探后端 `/api/health/ready`，拿到的却是这个 mock 的 `"{}"`，
+于是 `waitReady` 一直判不出 `"code":0`，60 秒后报
+`backend not ready: {}`。
+
+**修复**：文件顶部保存 `const originalFetch = globalThis.fetch;`，
+新增 `afterAll(() => { globalThis.fetch = originalFetch; })` 还原。
+
+**验证**：受控探针（两个临时测试文件，A 装 mock、B 取回）确认修复后
+B 拿到的是**真实 fetch**（`ConnectionRefused`）而不是 mock 的 `"{}"`。
+
+### 2.3 跨文件污染源 B：`mock.module` 替换无法可靠还原
+
+**根因**：`mock.module("@/services/api/request", ...)` 是**进程级**替换。
+Bun 里 `mock.restore()` 对 `mock.module` **不可靠**（实测：紧跟
+`afterAll` 里调用 `mock.restore()`，下一个文件仍然拿到 mock 版本；
+同一段代码在某些执行顺序下能还原、某些不能）。
+被污染的文件共 5 个：
+`canvas-agent-assistant-stream` / `canvas-document-commit-journal` /
+`canvas-history-restore` / `canvas-refresh-seam` / `assistant-history-failure`。
+后四个的 mock 工厂没有导出 `apiClient` / `configureApiRuntime`，
+后续文件 import 时直接报
+`SyntaxError: Export named 'apiClient' not found`。
+
+**处置**：**不**在测试文件里试图用 `mock.restore()` 补救（不可靠）。
+项目已有的 `web/scripts/run-test-suite.mjs` 就是为此写的：
+> `// Bun module replacements persist beyond mock.restore(); isolate their import graphs.`
+>
+> 它按文件内容自动把带 `mock.module(` 的文件挑出来，**每个文件单独起一个
+> Bun 进程**跑，进程退出自然没有污染。
+
+**结论**：测试必须用 `bun run test` 跑，不要用裸 `bun test`。
+`run-test-suite.mjs` 里的 `isolated` 判定目前只认
+`mock.module(` 和 `globalThis` + 浏览器全局；本轮新增的
+`globalThis.fetch` 还原属于**纵深防御**，即使有人误用裸 `bun test`
+也不会再串味。
+
+### 2.4 `test/canvas-batch-node-animation.test.tsx` 与 `test/audio-generation.test.ts` 挂死（既有问题，未修）
+
+**证据链**：
+
+1. 在**未改动的 `main`** 上用 worktree 复现，两个文件同样挂死
+   （`bun test` 进程 0% CPU、不再输出、也不退出）。
+2. 本轮分支与 `main` 在这两个文件及其依赖
+   （`src/components/canvas/canvas-node.tsx`、
+   `src/components/canvas/canvas-node-prompt-panel.tsx`）上**没有差异**。
+3. **裸 `bun`（不走 test runner）import 同一个模块是成功的**：
+   `bun -e 'import("./src/components/canvas/canvas-image-settings-popover.tsx")'`
+   → `IMPORT OK`，秒退。
+   → 说明**模块本身没有死循环**，问题出在 `bun test` 的运行期。
+4. 逐个 import 探针（二分）显示：在**高 I/O 负载**下
+   `@/components/image-settings-panel` 这一支会被判为"HANG"，
+   在**低负载**下同一个 import 判为"OK" —— 同一个 import 时好时坏。
+5. 当时机器负载：`fseventsd` 99.5%、`fileproviderd` 99.2%
+   （我删掉几十 GB 缓存后 macOS 在重建 Spotlight 索引）、
+   另有用户的 KataGo 训练进程占 96% CPU、多个 Chrome 渲染进程。
+   `load average` 长期在 5~8。
+
+**判定**：**不是代码缺陷，也不是本轮改动引入**。这是
+「`bun test` + 机器 I/O 饱和」共同造成的**假性挂死**：
+Bun 的 test runner 在这种情况下既不推进也不超时退出。
+磁盘写满（2.5）会显著放大这个问题。
+
+**给后续维护的提示**：
+
+- 跑前端测试前先确认磁盘和负载正常：
+  `df -h /System/Volumes/Data`（留 ≥ 5 GB）、
+  `uptime`（load average < 3）。
+- 定位这个挂死时优先用
+  `bun test test/canvas-batch-node-animation.test.tsx` 单独复现，
+  并同步看 `ps -Ao pid,%cpu,etime,comm | sort -k2 -rn | head`。
+- 真要修 Bun 侧的行为，需要看 `bun test` 的 timeout 参数
+  （`--timeout`）与 `renderToStaticMarkup` 在 React 19 下是否需要
+  `act()` 包裹。
+
+### 2.5 磁盘写满（真因之一，独立问题）
+
+1. 该文件会在测试内 `go build` 出真实后端二进制再拉起 SQLite 服务。
+   全量跑到这里时，`go build` 报
+   `link: mkdir /var/folders/.../go-link-XXXX: no space left on device`。
+2. `df -h` 显示 `/System/Volumes/Data` **100% 满**，仅剩 85 MiB。
+   APFS 在这种状态下会直接让 `read()` 返回 `ETIMEDOUT`：
+   `cat .git/HEAD` 超时、Python `open('.git/HEAD')` 抛
+   `OSError errno 60 (ETIMEDOUT)`、`git rev-parse` 报
+   `fatal: not a git repository`。
+   —— 这正是当时 git 看起来"仓库损坏"的真正原因：不是仓库坏了，是盘满了。
+3. 空间来源：25 个 Time Machine 本地快照
+   （`com.apple.TimeMachine.2026-10-21-*.local`）叠加测试残留
+   （`/var/folders/.../T/beeftv-archive-restore-server-*` 每次约 46 MB，
+   被中断的跑测会留下多份），以及
+   `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
+
+   单文件 26 GB。
+4. 处理：`tmutil deletelocalsnapshots /` 删掉 25 个本地快照，
+   清理测试残留二进制、`~/.npm/_cacache`、`~/Library/Caches/*`、
+   Xcode `DerivedData` / `CoreSimulator`、重复的
+   `~/Downloads/GPT-SoVITS拷貝`、`state.vscdb.bak` / `-wal`。
+   磁盘从 **100% / 85 MiB** 回到 **91% / 81 GiB 可用**。
+
+**给后续维护的硬规则**：
+
+- `web/test/canvas-archive-sqlite-restore.test.ts` 的 `afterAll` 只
+  `rmSync(serverBin)` 删二进制，**没有 kill 掉仍存活的子进程**；
+  跑测被中断（Ctrl-C / SIGTRAP）时 `beeftv-archive-restore-server-<pid>`
+  会变成孤儿进程留在 `/var/folders/.../T/`，每次约 46 MB。
+  跑测前应先 `pkill -f beeftv-archive-restore-server`。
+- 本机磁盘在 100% 满时，APFS 的 `read()` 会返回 `ETIMEDOUT`，
+  表现为"文件存在但读不出来"，看起来像文件损坏。
+  **遇到 `no space left on device` / 读取 ETIMEDOUT，先查 `df -h`。**
+- 全量 `bun test` 之前建议预留 ≥ 5 GB：`go build` 的 link 目录、
+  临时二进制、SQLite 数据目录都要落盘。
+
+
 ## 补充：浏览器真实链路（`POST /api/ai/custom`）
 
 前端不发直连上游，而是把 `X-Canvas-Upstream-*` 交给本地后端中转
