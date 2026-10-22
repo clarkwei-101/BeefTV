@@ -16,6 +16,21 @@
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
 
+# 3. Inductor's C++ wrapper needs <Python.h>, and python3-dev is not installed
+#    on this host (no sudo available to add it). That wrapper is CPU-side
+#    codegen, so for a GPU workload it is pure overhead: with it disabled,
+#    inductor emits Triton kernels directly and compiles cleanly on GB10.
+export TORCHINDUCTOR_CPP_WRAPPER=0
+
+# 4. Inductor's default compile pool forks worker subprocesses, and those
+#    children start without an initialized CUDA context, so
+#    triton_helpers.set_driver_to_gpu() dies in triton/runtime/driver.py
+#    ("self._active = self.default") and surfaces as InductorError:
+#    SubprocException on a Triton kernel that compiles fine in the parent.
+#    compile_threads=1 makes inductor compile in-process, where CUDA is
+#    already live. The tradeoff is slower compilation, not slower inference.
+export TORCHINDUCTOR_COMPILE_THREADS=1
+
 cd /home/clarkwei/ComfyUI || exit 1
 
 pkill -f "main.py --listen" 2>/dev/null

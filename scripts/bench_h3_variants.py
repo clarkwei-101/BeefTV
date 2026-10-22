@@ -148,6 +148,16 @@ if __name__ == "__main__":
         # Different seed: reusing it lets ComfyUI serve the graph from its
         # execution cache and report ~0s, which compares as "infinitely fast".
         m = run_once(a.prompt, a.seed + 1, unet, comp, "measured")
+        if m["status"] != "success":
+            # A failed render returns almost immediately, so leaving it in the
+            # table would print it as a huge speedup. torch.compile failed this
+            # way before CUDA_HOME was exported and read as "139x faster".
+            print(f"  FAILED: {m['status']}", flush=True)
+            results.append({"variant": name, "unet": unet,
+                            "torch_compile": comp, **m,
+                            "failed": m["status"]})
+            (HERE / a.out).write_text(json.dumps(results, indent=2))
+            continue
         if m["duration_s"] <= 0:
             raise RuntimeError(f"{name}: measured render was cache-served (0.0s)")
         print(f"  measured {m['duration_s']}s {m['status']}", flush=True)
@@ -155,11 +165,16 @@ if __name__ == "__main__":
         (HERE / a.out).write_text(json.dumps(results, indent=2))
 
     print("\n=== RESULT ===")
-    base = next((r for r in results if r.get("variant") == "int8"), None)
+    base = next((r for r in results
+                 if r.get("variant") == "int8" and not r.get("failed")), None)
     for r in results:
         if r.get("skipped"):
             print(f"  {r['variant']:<14} SKIP ({r['skipped']})")
             continue
-        sp = f"  {base['duration_s'] / r['duration_s']:.3f}x" if base and r.get("duration_s") else ""
+        if r.get("failed"):
+            print(f"  {r['variant']:<14} FAILED ({r['failed']}, {r['duration_s']}s) - not a speedup")
+            continue
+        sp = (f"  {base['duration_s'] / r['duration_s']:.3f}x"
+              if base and base.get("duration_s") else "")
         print(f"  {r['variant']:<14} {r['duration_s']:>7}s{sp}")
     print("DONE")
