@@ -1,0 +1,22 @@
+[
+  {
+    "variant": "pytorch",
+    "tag": "measured",
+    "prompt_id": "c140371c-c5d7-4281-b0d1-1345f40966d0",
+    "duration_s": 340.4,
+    "status": "success",
+    "fully_cached": true,
+    "n_messages": 3,
+    "backend_line": "[INFO] Using pytorch attention"
+  },
+  {
+    "variant": "sage",
+    "tag": "measured",
+    "prompt_id": "e5a7f2f7-d08a-4bd5-8304-49d1d612a9c3",
+    "duration_s": 321.8,
+    "status": "success",
+    "fully_cached": true,
+    "n_messages": 3,
+    "backend_line": "[INFO] Using sage attention"
+  }
+]

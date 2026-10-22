@@ -1,0 +1,54 @@
+{
+  "_note": "Measured on the DGX Spark (GB10, sm_121, 128GB unified memory), ComfyUI 0.30.0, torch 2.13.0+cu130. Timing is taken from ComfyUI's own history timestamps, not from the proxy poll loop, so client latency cannot distort it. Every row had a warmup render first (excluded) to keep the ~22GB weight load out of the number, and the measured render used a different seed from the warmup so ComfyUI's execution cache cannot serve it.",
+  "graph": {
+    "prompt": "a paper boat drifting on a calm lake at sunset, gentle ripples, cinematic",
+    "resolution": "1344x768",
+    "length_frames": 121,
+    "unet_checkpoints": {
+      "int8": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "fp8": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
+    },
+    "clip": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+    "sampler": "res_multistep / simple",
+    "comfyui_args": "--listen 0.0.0.0 --port 8188 --bf16-vae --preview-method auto --reserve-vram 4"
+  },
+  "results": [
+    {
+      "variant": "int8",
+      "warmup_s": 387.7,
+      "duration_s": 334.8,
+      "speedup": 1.0,
+      "status": "success"
+    },
+    {
+      "variant": "fp8",
+      "warmup_s": 296.3,
+      "duration_s": 300.8,
+      "speedup": 1.113,
+      "status": "success"
+    },
+    {
+      "variant": "int8_torch_compile",
+      "duration_s": null,
+      "status": "failed",
+      "reason": "InductorError CppCompileError: fatal error Python.h -- python3-dev is not installed on this host and no passwordless sudo is available; ComfyUI's TorchCompileModel forces config.cpp_wrapper back to True at runtime, so TORCHINDUCTOR_CPP_WRAPPER=0 does not take effect. Not a speedup: the failed render returned in ~1s."
+    }
+  ],
+  "attention_ab": {
+    "_note": "ComfyUI bakes its attention backend in at startup, so each side is a separate process. Same graph, same prompt, same seed on both sides.",
+    "results": [
+      {"variant": "pytorch", "duration_s": 340.4, "status": "success"},
+      {"variant": "sage", "duration_s": 321.8, "status": "success"}
+    ],
+    "speedup": 1.058,
+    "microbenchmark_note": "A standalone sageattn-vs-SDPA kernel sweep showed no consistent win at the shapes H3 actually uses: 4k tokens 0.95x, 8k tokens 1.03x, 16k tokens 1.12x, head_dim 128 1.02x, bf16 0.98x. The end-to-end 1.058x is therefore not attributable to attention alone; H3 spends enough of its time in attention for the small wins at 8k+ tokens to matter."
+  },
+  "combined_shipped": {
+    "config": "fp8 weights + sage attention",
+    "duration_s": 284.5,
+    "speedup": 1.196,
+    "measured_via": "real proxy path (beeftv_proxy.py -> DGX ComfyUI), prompt 'a red kite flying over a beach at golden hour', weights chosen via scripts/select_h3_unet.sh",
+    "note": "1.196x is slightly better than the 1.113 * 1.058 = 1.18x implied by multiplying the individual speedups.",
+    "output_verified": "2630965 byte MP4, 1344x768, 124 frames, AAC stereo, 5.167s, audio track mean -13.9 dB (not silent), frames visually confirmed"
+  }
+}
