@@ -6,6 +6,19 @@
 - 启动参数：`--listen 0.0.0.0 --port 8188 --bf16-vae --preview-method auto --reserve-vram 4 --use-sage-attention`
 - 原始数据：[`h3-acceleration-results.json`](./h3-acceleration-results.json)
 
+## 〇、调研来源
+
+结论不是凭空判断的，逐项对照了上游来源。**其中两条直接推翻了我最初的判断**：
+
+| 结论 | 来源 | 说明 |
+| --- | --- | --- |
+| SageAttention 2.2 在 GB10 可用 | [thu-ml/SageAttention](https://github.com/thu-ml/sageattention/) 官方安装说明；[HF 社区 wheel](https://huggingface.co/Sggin/sage-attention-2.2-dgx-spark-aarch64-cu13)；[thu-ml/SageAttention#297](https://github.com/thu-ml/SageAttention/pull/297) | 官方 `setup.py` 的 `SUPPORTED_ARCHS` 不含 `12.1`，所以按 `TORCH_CUDA_ARCH_LIST="12.0"` 构建；sm_120 SASS 经前向兼容在 sm_121 上原生运行 |
+| **sm_121 = sm_120 前向兼容** | [NVIDIA 论坛 ptrblck 确认](https://medium.com/@rakshith.d26/flash-attention-on-sm-121-solving-pytorch-compatibility-on-blackwell-gb10-a83d9ff3cf9b) | 这是本次最重要的背景知识：**大量库不是"不支持 sm_121"，而是自己在做架构白名单检查** |
+| **TensorRT 官方支持 GB10** | [TensorRT Edge-LLM 支持矩阵](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html) | **DGX Spark (GB10) 明确列为 `Official`，CUDA 13.0 + TensorRT 10 系统包**。我最初"缺少公开支持记录"的判断是错的，见第五节 |
+| TensorRT-LLM 在 SM121 的坑 | [TRT-LLM #14575](https://github.com/NVIDIA/TensorRT-LLM/issues/14575)、[#12141](https://github.com/NVIDIA/TensorRT-LLM/pull/12141) | SM12x 共享内存只有 99 KiB（SM100 有 227 KiB），CUTLASS 的 SM120 tile 配置直接溢出；#14575 在 1.3.0rc15 上 MTP 路径仍失败，rc17 才由 #13773 修复 |
+| **EasyCache 会损坏 H3 音频** | [ComfyUI #15326](https://github.com/Comfy-Org/ComfyUI/issues/15326)、[`nodes_easycache.py`](https://github.com/Comfy-Org/ComfyUI/blob/v0.30.2/comfy_extras/nodes_easycache.py)、[#12231](https://github.com/Comfy-Org/ComfyUI/pull/12231) | #12231 明言"缓存决策仍只基于 video tensor"；H3 音频按 `d(σ_a)/d(σ_v)` 缩放（从 4.00 到 0.26），跨 step 重放必然缩放错误 |
+| **本机 ComfyUI 0.30.0 缺少 H3 修复** | [H3 ComfyUI 版本指南](https://minimax-h3ai.video/blog/minimax-h3-comfyui) | 0.31.0 才带 `#15390`（EasyCache 音频修复）与 `#15243`（采样器过冲音频调度）；0.32.0 带 `#15486`（H3 峰值内存） |
+
 ## 一、测量方法（为什么这些数字可信）
 
 加速对比最容易出错的地方不是"跑得慢"，而是"测出一个不存在的加速"。本次踩到的坑都
@@ -24,7 +37,8 @@
 ### 4.1 最重要的一条：单次测量在本机不可信，方差约 20%
 
 把**完全相同**的配置连续跑两次，拿到的是 **274.4 s** 和 **328.9 s** —— 极差 19.9%。
-加上同配置在另一次会话中的 448.8 s，同一配置的跨度是 **274–449 s**。
+加上同配置在另两次会话中的 370.1 s 与 448.8 s，同一配置的跨度是 **274–449 s**，
+最好与最差相差 **1.64 倍**。
 
 原因是这台机器不是独占的：DGX 上 `ds4-server`（DeepSeek V4 服务）常驻并占用
 **103 GB / 130.6 GB**，ComfyUI 可用显存随之在 11.4 GB 到约 100 GB 之间浮动，而 H3 权重
@@ -45,7 +59,7 @@ denoising 步耗从 1.78 s/it 波动到 92.11 s/it。
 | fp8 | fp8 scaled | PyTorch SDPA | 300.8 s | 1.113×（**噪声内**） |
 | SageAttention | int8 ConvRot | SageAttention | 321.8 s | 1.058×（**噪声内**） |
 | fp8 + sage（出厂配置） | fp8 scaled | SageAttention | 274.4 / 284.5 s | **1.20×（超出噪声，可信）** |
-| fp8 + sage 复测 | fp8 scaled | SageAttention | 328.9 / 448.8 s | 同配置离散 |
+| fp8 + sage 复测 | fp8 scaled | SageAttention | 328.9 / 370.1 / 448.8 s | 同配置离散 |
 | TorchCompile | int8 | PyTorch | — | **失败，见第四节** |
 
 需要分开看这三档：
@@ -77,6 +91,21 @@ denoising 步耗从 1.78 s/it 波动到 92.11 s/it。
 
 另外 bf16 反而慢 0.98×，而 H3 正是 bf16 权重 —— 这也是收益被限制的原因之一。
 
+### 需要知情的上游风险：SageAttention 在 DGX Spark 上有过输出损坏报告
+
+启用 sage 之前必须知道这条：[thu-ml/SageAttention#297](https://github.com/thu-ml/SageAttention/pull/297)
+中有人报告，在 DGX Spark 上用 SageAttention 跑 Wan 2.2 视频工作流时"输出半损坏"，该问题
+尚未有官方结论。
+
+本项目的处置：
+
+* 装的是**未改动的上游 v2.2.0**（按 `TORCH_CUDA_ARCH_LIST="12.0"` 构建），不是 Sage 3 的
+  Blackwell 专用路径；#297 报告的是需要手改 `api.cu` 才能跑的那个 3.x 路径。
+* 验收方式是**逐帧目视 + 音轨 RMS 校验**，不只看"渲染成功"。本次 5 次 H3 渲染（274–449s
+  区间）均输出画面正常、音轨 mean −13.9/−14.0 dB 非静音。
+* 若日后出现花屏或音画不同步，第一嫌疑就是 sage，回退只需从 systemd 单元移除
+  `--use-sage-attention`（代价是约 1.05×，且该值本身在噪声边缘）。
+
 ## 三、被拒绝的假数据
 
 以下三个都曾经或很容易产生"看起来极快"的错误结论，记录在此以免重犯：
@@ -92,7 +121,8 @@ denoising 步耗从 1.78 s/it 波动到 92.11 s/it。
 | 项目 | 状态 | 理由 |
 | --- | --- | --- |
 | **torch.compile / Inductor** | **不可用** | 阻塞点是 **环境缺 `python3-dev`**（`/usr/include/python3.12/Python.h` 不存在），需要 sudo 密码，无法非交互安装。**不是硬件问题** —— 见下 |
-| **TensorRT / torch_tensorrt** | 未采用 | 本机完全未安装（`ModuleNotFoundError`）。GB10 为 sm_121，TensorRT 对该架构的 kernel 支持缺少公开可用记录，且 ComfyUI 的 H3 路径不经过 TensorRT 节点，投入产出不成立 |
+| **TensorRT / torch_tensorrt** | 未采用（**理由已更正**） | 我最初写"GB10 为 sm_121，缺少公开支持记录"是**错的** —— [官方矩阵明确列出 DGX Spark (GB10) 为 `Official`](https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html)。真实不采用理由是：① 本机完全未安装（`ModuleNotFoundError`）；② ComfyUI 的 H3 路径不经过任何 TensorRT 节点，要接入需自己写 engine 并替换 DiT 节点；③ 即使装上，SM12x 只有 99 KiB 共享内存（SM100 为 227 KiB），[CUTLASS 的 SM120 tile 配置会直接溢出](https://github.com/NVIDIA/TensorRT-LLM/pull/12141)，需逐个 kernel 调参。投入产出不成立 |
+| **SageAttention 3（Blackwell 专用路径）** | 未采用 | [thu-ml/SageAttention#297](https://github.com/thu-ml/SageAttention/pull/297) 记录了它在 DGX Spark 上"能跑但输出半损坏"，且需手改 `api.cu` 注释掉 Blackwell 检查。本项目不允许回归，不采用 |
 | **TeaCache / CacheGen** | 未采用 | 属于 EasyCache 同类的缓存复用，同样在 H3 的音频分支上有已知的跨调度错缩放风险（ComfyUI#15326），与下面被禁用的项同源 |
 | **EasyCache** | **主动禁用** | 见第五节 |
 | **VAE tiling** | 未采用 | H3 输出 1344×768×121 帧，bf16 VAE 在 128GB 统一内存上不构成显存瓶颈；实测 `/health` 报告 `degraded: []`，没有 OOM 压力可解，收益无法测量 |
@@ -162,8 +192,35 @@ EasyCache 按**视频流**的残差变化率决定跳过哪些 step，再把缓�
 完全正常、声音是错的"的文件。实测表现：音乐类提示词下音频 RMS 掉到约 0.50、谱质心整体
 上移（低频直接消失），而**同一批次的 video SSIM 仍有 0.95** —— 只做画面审查发现不了。
 
+上游状态（`Comfy-Org/ComfyUI#15326`）：这是**已确认的回归**，`#12231` 明言"缓存决策仍只
+基于 video tensor"，而 H3 音频按 `d(σ_a)/d(σ_v)` 缩放（实测该因子从 σ_v=1.0 时的 4.00
+降到接近 0 时的 0.26，相邻早期 step 之间大约减半），所以在 step A 缓存的残差拿到
+step B 重放时缩放必然是错的。节点自己打印的加速比也不计入音频跳步
+（`total_steps_skipped` 只在 `if not is_audio` 时累加）。
+
+修复在 **ComfyUI 0.31.0**（`#15390`）。**本机是 v0.30.0，不含该修复**，因此即使有人手动
+打开这个开关，损坏照样发生。
+
 代码层面已拒绝：即使设置了 `BEEFTV_H3_EASYCACHE_THRESHOLD`，代理也会拒绝启用并打日志，
 除非显式设置 `BEEFTV_H3_EASYCACHE_ALLOW_AUDIO_LOSS=1`。
+
+### 附带发现：ComfyUI 版本落后于 H3 修复
+
+本机 `v0.30.0-4-g9a9fdb10`。从 0.30.0 到 0.32.0 之间落地了至少 7 项 H3 相关修复：
+
+| 版本 | PR | 修复内容 | 严重度 |
+| --- | --- | --- | --- |
+| 0.31.0 | `#15243` | 采样器过冲音频调度，4 步时音频为噪声 | blocker |
+| 0.31.0 | `#15390` | **EasyCache 损坏音轨** | major |
+| 0.31.0 | `#15377` | 音频 VAE 无法完整 offload | major |
+| 0.31.0 | `#15334` | `int8_convrot` VAE 无法加载 | major |
+| 0.32.0 | `#15486` | **H3 峰值内存问题**（24GB 卡从跑不完到能跑完） | blocker |
+| 0.32.0 | `#15477` | Tiled VAE decode 在 NestedTensor latent 上崩溃 | major |
+
+**`#15486` 与本项目直接相关**：H3 的峰值内存正是本机最大的限制因素，而 0.30.0 仍在修这个
+问题。升级 ComfyUI 很可能同时带来内存与稳定性收益，**但这是版本升级而非加速项，且会改变
+渲染行为，需要你确认后再做**。本次未执行升级 —— 现有实测数据全部建立在 0.30.0 上，升级后
+所有加速数字都需要重测。
 
 ## 七、兼容性回归
 

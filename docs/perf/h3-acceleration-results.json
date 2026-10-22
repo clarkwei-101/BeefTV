@@ -45,8 +45,9 @@
   },
   "noise_floor": {
     "_note": "THE MOST IMPORTANT NUMBER IN THIS FILE. Identical configuration, run twice back to back on an idle machine, gave 274.4s and 328.9s -- a 19.9% spread. The same configuration also produced 448.8s in another session. So any single-run speedup smaller than roughly 20% on this host cannot be distinguished from noise.",
-    "identical_config_samples_s": [274.4, 328.9, 448.8],
+    "identical_config_samples_s": [274.4, 328.9, 370.1, 448.8],
     "spread_pct": 19.9,
+    "best_to_worst_ratio": 1.64,
     "root_cause": "ds4-server (DeepSeek V4, --ctx 32768) holds 103 GB of the 130.6 GB unified memory. ComfyUI's free VRAM therefore floats between ~11.4 GB and ~100 GB while H3 weights are ~22 GB, so the model is fully resident when memory is free and gets split/paged when it is not. ComfyUI's own log shows per-step denoising cost for one identical configuration ranging from 1.78 s/it to 92.11 s/it.",
     "evidence": "GET /system_stats during contention reported vram_free = 11433387040 (10.6 GiB) out of vram_total = 130663591936 (121.7 GiB); nvidia-smi --query-compute-apps showed ds4-server using 103446 MiB.",
     "consequence": "The 1.113x (fp8) and 1.058x (sage) single-point results sit inside this band and must be read as 'not slower', not 'faster'. Only the best-sample fp8+sage figure (~1.20x vs baseline) exceeds the band."
@@ -63,9 +64,35 @@
     ],
     "conclusion": "--lowvram costs ~1.05x on the PyTorch side and the same ordering holds with sage. Direction is unambiguous (forced weight splitting only adds CPU<->GPU page traffic and cannot remove work), so removing it is safe even though the magnitude sits near the noise band."
   },
+  "upstream_risk_disclosed": {
+    "sageattention_on_dgx_spark": {
+        "source": "https://github.com/thu-ml/SageAttention/pull/297",
+        "report": "A user reported semi-corrupted output when running a Wan 2.2 video workflow on DGX Spark with sage attention. No official resolution is recorded.",
+        "mitigation": "Installed wheel is unmodified upstream v2.2.0 built with TORCH_CUDA_ARCH_LIST=12.0, not the Sage 3 Blackwell path that #297 describes (which additionally requires hand-editing api.cu). Every H3 render was verified frame-by-frame visually plus an audio RMS check, not just 'status: succeeded'.",
+        "revert": "Remove --use-sage-attention from scripts/comfyui-dgx.service. Costs ~1.05x, itself near the noise floor.",
+        "verified_renders": 5
+    },
+    "comfyui_version_behind": {
+        "installed": "v0.30.0-4-g9a9fdb10",
+        "missing_h3_fixes": [
+            {"version": "0.31.0", "pr": "#15243", "fix": "sampler over-steps the audio schedule; audio is noise at 4 steps", "severity": "blocker"},
+            {"version": "0.31.0", "pr": "#15390", "fix": "EasyCache corrupts the soundtrack", "severity": "major"},
+            {"version": "0.31.0", "pr": "#15377", "fix": "full offload of the audio VAE fails", "severity": "major"},
+            {"version": "0.31.0", "pr": "#15334", "fix": "int8_convrot VAE will not load", "severity": "major"},
+            {"version": "0.32.0", "pr": "#15486", "fix": "peak memory issue with H3 (the memory ceiling is this project's binding constraint)", "severity": "blocker"},
+            {"version": "0.32.0", "pr": "#15477", "fix": "tiled VAE decode crashes on NestedTensor latents", "severity": "major"}
+        ],
+        "action_taken": "none -- this is a version upgrade, not an acceleration item, and it changes render behaviour. All measurements in this file were taken on 0.30.0 and would need re-running after an upgrade. Flagged for the user to decide."
+    },
+    "tensorrt_support_correction": {
+        "originally_claimed": "GB10 sm_121 has no public record of TensorRT support",
+        "corrected": "The official TensorRT Edge-LLM support matrix lists NVIDIA DGX Spark (GB10) as an Official target (CUDA 13.0 + TensorRT 10, system package). See https://nvidia.github.io/TensorRT-Edge-LLM/latest/user_guide/getting_started/support-matrix.html",
+        "reason_still_not_adopted": "Not installed locally; ComfyUI's H3 path uses no TensorRT node so adoption means writing an engine and replacing the DiT node; and SM12x has only 99 KiB shared memory vs 227 KiB on SM100, which overflows CUTLASS's SM120 tile configs (https://github.com/NVIDIA/TensorRT-LLM/pull/12141)."
+    }
+  },
   "combined_shipped": {
     "config": "fp8 weights + sage attention, --reserve-vram 4, --use-sage-attention",
-    "samples_s": [274.4, 284.5, 328.9, 448.8],
+    "samples_s": [274.4, 284.5, 328.9, 370.1, 448.8],
     "best_sample_s": 274.4,
     "claimed_speedup": "1.20x versus the 340.4s baseline, but only on the best sample; see noise_floor",
     "measured_via": "real proxy path (beeftv_proxy.py -> DGX ComfyUI) for the 284.5s sample, benchmark script for the rest",
