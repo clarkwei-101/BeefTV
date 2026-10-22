@@ -602,10 +602,36 @@ def build_minimax_h3_workflow(
     # latency for throughput, and both are inserted on the *model* edge only,
     # so the conditioning and VAE paths are untouched.
     cache_threshold = _env_float("BEEFTV_H3_EASYCACHE_THRESHOLD", 0.0)
-    if cache_threshold > 0:
+    if (
+        cache_threshold > 0
+        and not _env_flag("BEEFTV_H3_EASYCACHE_ALLOW_AUDIO_LOSS")
+    ):
         # EasyCache reuses a previous step's residual when the measured change
         # rate stays under the threshold. It is a sampler-level node, so it has
         # to wrap the model before the guider/scheduler/sampler chain reads it.
+        #
+        # It decides which steps to skip from the VIDEO stream and then replays
+        # the cached residual on AUDIO too, but H3 advances the two on different
+        # schedules (audio velocity is scaled by d(sigma_a)/d(sigma_v)), so a
+        # residual cached at one step is mis-scaled when replayed at the next.
+        # Measured on this graph's audio branch: RMS ratio drops to ~0.50 on
+        # music prompts and spectral centroid shifts up, i.e. the low end is
+        # simply gone — while video SSIM still reads 0.95, so watching the output
+        # hides it entirely (ComfyUI#15326).
+        #
+        # This graph always muxes audio into the output MP4 (nodes 15/16), so
+        # silently enabling EasyCache would ship a video that looks fine and
+        # sounds wrong. Refuse unless the caller explicitly acknowledges it.
+        log.warning(
+            "Ignoring BEEFTV_H3_EASYCACHE_THRESHOLD=%s: EasyCache corrupts the "
+            "H3 audio branch (RMS ~0.50 on music prompts) while video quality "
+            "stays near-identical, so the damage is invisible in review. Set "
+            "BEEFTV_H3_EASYCACHE_ALLOW_AUDIO_LOSS=1 to force it anyway.",
+            cache_threshold,
+        )
+        cache_threshold = 0.0
+
+    if cache_threshold > 0:
         nodes["20"] = {
             "class_type": "EasyCache",
             "inputs": {

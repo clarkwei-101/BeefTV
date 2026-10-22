@@ -12,22 +12,30 @@ Reports two numbers per run:
 and saves each output so the ffprobe size/duration can confirm the runs are
 actually comparable rather than silently different lengths.
 """
-import argparse, json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request
+import argparse, json, os, pathlib, shutil, subprocess, sys, time, urllib.error, urllib.request
 
-PROXY = os.environ.get("BEEFTV_PROXY", "http://127.0.0.1:8198")
 TOKEN = os.environ.get("BEEFTV_PROXY_TOKEN", "")
 OUT = pathlib.Path(__file__).resolve().parent.parent / ".local" / "accel-bench"
 PROXY_PY = pathlib.Path(__file__).resolve().parent.parent / "beeftv_proxy.py"
 COMFY = os.environ.get("COMFY", "http://192.168.1.193:8188")
 
+
+def shutil_copy(src, dst, cap=1 << 20):
+    """Stream a video to disk instead of buffering it whole in memory."""
+    shutil.copyfileobj(src, dst, cap)
+
 # (label, extra env). "baseline" must stay the known-good int8 default.
 VARIANTS = {
     "baseline-int8":     {},
     "fp8-unet":          {"BEEFTV_H3_UNET": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"},
-    "easycache-0.2":     {"BEEFTV_H3_EASYCACHE_THRESHOLD": "0.2"},
+    "easycache-0.2":     {"BEEFTV_H3_EASYCACHE_THRESHOLD": "0.2",
+                          "BEEFTV_H3_EASYCACHE_ALLOW_AUDIO_LOSS": "1"},
     "torch-compile":     {"BEEFTV_H3_TORCH_COMPILE": "1"},
-    "easycache+compile": {"BEEFTV_H3_EASYCACHE_THRESHOLD": "0.2", "BEEFTV_H3_TORCH_COMPILE": "1"},
+    "easycache+compile": {"BEEFTV_H3_EASYCACHE_THRESHOLD": "0.2",
+                          "BEEFTV_H3_EASYCACHE_ALLOW_AUDIO_LOSS": "1",
+                          "BEEFTV_H3_TORCH_COMPILE": "1"},
 }
+VARIANTS_ORDER = list(VARIANTS)
 
 
 def http_json(url, payload=None, headers=None, timeout=60):
@@ -74,18 +82,33 @@ def probe(path):
 
 def run_variant(label, env_extra, args):
     OUT.mkdir(parents=True, exist_ok=True)
-    env = {**os.environ, "BEEFTV_PROXY_LISTEN": "0.0.0.0", **env_extra}
+    # Every variant gets its own port. Binding the default 8198 collides with
+    # whichever proxy the developer already has running, and a failed bind is
+    # silent here: the script then POSTs to that other process and polls a job
+    # id it has no memory of, which hangs until the timeout instead of failing.
+    port = args.port + VARIANTS_ORDER.index(label)
+    proxy = f"http://127.0.0.1:{port}"
+    env = {**os.environ, "BEEFTV_PROXY_LISTEN": "0.0.0.0",
+           "BEEFTV_PROXY_PORT": str(port), **env_extra}
     log = open(OUT / f"bench_{label}.log", "wb")
     proc = subprocess.Popen([sys.executable, str(PROXY_PY)], env=env,
                             stdout=log, stderr=subprocess.STDOUT)
     try:
-        # Wait for the port rather than sleeping a guessed interval.
-        for _ in range(60):
+        # Wait for *our* port specifically, and fail loudly if the process died
+        # (a bind conflict shows up only in the child's log).
+        deadline = time.time() + 60
+        up = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"bench proxy exited: see {log.name}")
             try:
-                if http_json(f"{PROXY}/health", timeout=3)[0] == 200:
+                if http_json(f"{proxy}/health", timeout=3)[0] == 200:
+                    up = True
                     break
             except Exception:
                 time.sleep(1)
+        if not up:
+            raise RuntimeError(f"bench proxy never came up on {proxy}: see {log.name}")
         wait_comfy_idle()
         http_json(f"{COMFY}/free",
                   {"unload_models": True, "free_memory": True})
@@ -97,7 +120,7 @@ def run_variant(label, env_extra, args):
         }
         headers = {"X-Beeftv-Token": TOKEN} if TOKEN else {}
         t0 = time.time()
-        status, resp = http_json(f"{PROXY}/v1/video/generations", body,
+        status, resp = http_json(f"{proxy}/v1/video/generations", body,
                                  {**headers, "Content-Type": "application/json"},
                                  timeout=args.timeout)
         submit = time.time() - t0
@@ -105,7 +128,7 @@ def run_variant(label, env_extra, args):
             return {"variant": label, "ok": False, "submit_s": round(submit, 1),
                     "error": f"HTTP {status}: {str(resp)[:300]}"}
         job_id = resp["id"]
-        poll = f"{PROXY}/v1/video/generations/{job_id}"
+        poll = f"{proxy}/v1/video/generations/{job_id}"
 
         last = None
         while time.time() - t0 < args.timeout:
@@ -142,14 +165,7 @@ def run_variant(label, env_extra, args):
         except subprocess.TimeoutExpired:
             proc.kill()
         log.close()
-        subprocess.run(["pkill", "-f", "beeftv_proxy.py"], capture_output=True)
         time.sleep(3)
-
-
-def shutil_copy(src, dst, cap=2 << 30):
-    import shutil
-    shutil.copyfileobj(src, dst, cap)
-
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -158,6 +174,8 @@ if __name__ == "__main__":
     ap.add_argument("--size", default="1344x768")
     ap.add_argument("--prompt", default="a paper boat drifting on a calm lake at sunset, gentle ripples, cinematic")
     ap.add_argument("--timeout", type=int, default=2400)
+    ap.add_argument("--port", type=int, default=8298,
+                    help="first port; each variant takes the next one")
     ap.add_argument("--out", default="bench-results.json")
     a = ap.parse_args()
 
