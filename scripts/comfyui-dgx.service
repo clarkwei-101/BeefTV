@@ -1,0 +1,57 @@
+# ComfyUI 0.30 on DGX Spark (NVIDIA GB10)
+#
+# Launch flags here are not cosmetic. This unit is enabled via
+# default.target.wants, so it runs at every boot -- anything missing from
+# ExecStart silently falls back to the slower default after a reboot.
+#
+# The flags were reconciled against measured end-to-end H3 renders
+# (scripts/bench_h3_variants.py, results in docs/perf/). Two corrections:
+#
+#   * --use-sage-attention was absent, so the DiT ran on PyTorch SDPA even
+#     though sage was installed and working. Adding it measured 340.4s ->
+#     321.8s on the int8 weights.
+#   * --reserve-vram 8 -> 4. 8 GB of the 128 GB unified memory was being held
+#     back from the model for no measured benefit, and every H3 graph here
+#     runs on a single GPU with nothing else resident.
+#
+# --lowvram was deliberately REMOVED. It forces weight splitting into host
+# memory, and on a 128 GB unified-memory board it only adds page traffic
+# between CPU and GPU. Measured 352.3s -> 334.8s on identical int8 weights.
+# See docs/perf/h3-acceleration-report.md; do not re-add it without re-measuring.
+#
+# CAVEAT ON ALL TIMINGS HERE: this host is shared with ds4-server, which holds
+# 103 GB of the 130.6 GB unified memory, so the same configuration has been
+# observed at both 274s and 449s. Treat differences under ~20% as noise.
+[Unit]
+Description=ComfyUI 0.30 on DGX Spark (NVIDIA GB10)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ComfyUI
+ExecStart=%h/ComfyUI/venv/bin/python %h/ComfyUI/main.py \
+    --listen 0.0.0.0 \
+    --port 8188 \
+    --bf16-vae \
+    --preview-method auto \
+    --reserve-vram 4 \
+    --use-sage-attention
+TimeoutStartSec=600
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+KillMode=mixed
+RemainAfterExit=yes
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512"
+Environment="PY_INCLUDE_DIR=/home/clarkwei/.local/share/uv/python/cpython-3.11.15-linux-aarch64-gnu/include/python3.11"
+# Triton compiles a small C helper against cuda_runtime.h at first use; without
+# this the compile dies in a subprocess and surfaces as an InductorError that
+# reads like an unsupported GPU architecture. The toolkit is already installed.
+Environment="CUDA_HOME=/usr/local/cuda"
+Environment="PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=default.target

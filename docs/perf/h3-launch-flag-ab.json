@@ -1,0 +1,20 @@
+[
+  {
+    "variant": "measured_sage+fp8",
+    "unet": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+    "torch_compile": false,
+    "tag": "measured",
+    "duration_s": 274.4,
+    "status": "success",
+    "n_messages": 3
+  },
+  {
+    "variant": "measured_sage+fp8",
+    "unet": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+    "torch_compile": false,
+    "tag": "measured",
+    "duration_s": 328.9,
+    "status": "success",
+    "n_messages": 3
+  }
+]

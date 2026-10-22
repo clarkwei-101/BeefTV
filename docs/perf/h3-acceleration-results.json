@@ -43,12 +43,32 @@
     "speedup": 1.058,
     "microbenchmark_note": "A standalone sageattn-vs-SDPA kernel sweep showed no consistent win at the shapes H3 actually uses: 4k tokens 0.95x, 8k tokens 1.03x, 16k tokens 1.12x, head_dim 128 1.02x, bf16 0.98x. The end-to-end 1.058x is therefore not attributable to attention alone; H3 spends enough of its time in attention for the small wins at 8k+ tokens to matter."
   },
+  "noise_floor": {
+    "_note": "THE MOST IMPORTANT NUMBER IN THIS FILE. Identical configuration, run twice back to back on an idle machine, gave 274.4s and 328.9s -- a 19.9% spread. The same configuration also produced 448.8s in another session. So any single-run speedup smaller than roughly 20% on this host cannot be distinguished from noise.",
+    "identical_config_samples_s": [274.4, 328.9, 448.8],
+    "spread_pct": 19.9,
+    "root_cause": "ds4-server (DeepSeek V4, --ctx 32768) holds 103 GB of the 130.6 GB unified memory. ComfyUI's free VRAM therefore floats between ~11.4 GB and ~100 GB while H3 weights are ~22 GB, so the model is fully resident when memory is free and gets split/paged when it is not. ComfyUI's own log shows per-step denoising cost for one identical configuration ranging from 1.78 s/it to 92.11 s/it.",
+    "evidence": "GET /system_stats during contention reported vram_free = 11433387040 (10.6 GiB) out of vram_total = 130663591936 (121.7 GiB); nvidia-smi --query-compute-apps showed ds4-server using 103446 MiB.",
+    "consequence": "The 1.113x (fp8) and 1.058x (sage) single-point results sit inside this band and must be read as 'not slower', not 'faster'. Only the best-sample fp8+sage figure (~1.20x vs baseline) exceeds the band."
+  },
+  "launch_flag_ab": {
+    "_note": "The systemd unit comfyui-dgx.service is enabled via default.target.wants, so it runs at every boot and its ExecStart flags are the ones that actually persist. These rows compare that unit's flags against the flags used for the headline measurement.",
+    "int8_weights": [
+      {"profile": "unit (--lowvram --reserve-vram 8)", "duration_s": 352.3, "status": "success"},
+      {"profile": "measured (--reserve-vram 4)", "duration_s": 334.8, "status": "success"}
+    ],
+    "int8_weights_sage": [
+      {"profile": "unit_sage (--lowvram --reserve-vram 8)", "duration_s": 332.5, "status": "success"},
+      {"profile": "measured_sage (--reserve-vram 4)", "duration_s": 321.8, "status": "success"}
+    ],
+    "conclusion": "--lowvram costs ~1.05x on the PyTorch side and the same ordering holds with sage. Direction is unambiguous (forced weight splitting only adds CPU<->GPU page traffic and cannot remove work), so removing it is safe even though the magnitude sits near the noise band."
+  },
   "combined_shipped": {
-    "config": "fp8 weights + sage attention",
-    "duration_s": 284.5,
-    "speedup": 1.196,
-    "measured_via": "real proxy path (beeftv_proxy.py -> DGX ComfyUI), prompt 'a red kite flying over a beach at golden hour', weights chosen via scripts/select_h3_unet.sh",
-    "note": "1.196x is slightly better than the 1.113 * 1.058 = 1.18x implied by multiplying the individual speedups.",
+    "config": "fp8 weights + sage attention, --reserve-vram 4, --use-sage-attention",
+    "samples_s": [274.4, 284.5, 328.9, 448.8],
+    "best_sample_s": 274.4,
+    "claimed_speedup": "1.20x versus the 340.4s baseline, but only on the best sample; see noise_floor",
+    "measured_via": "real proxy path (beeftv_proxy.py -> DGX ComfyUI) for the 284.5s sample, benchmark script for the rest",
     "output_verified": "2630965 byte MP4, 1344x768, 124 frames, AAC stereo, 5.167s, audio track mean -13.9 dB (not silent), frames visually confirmed"
   }
 }

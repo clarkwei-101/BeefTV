@@ -30,6 +30,22 @@ RESTART = "/home/clarkwei/restart_comfy.sh"
 DEFAULT_ARGS = ("--listen 0.0.0.0 --port 8188 --bf16-vae "
                 "--preview-method auto --reserve-vram 4")
 
+# The systemd unit comfyui-dgx.service (enabled via default.target.wants, so it
+# runs at every boot) launches with --lowvram --reserve-vram 8 and no sage
+# attention. That is a different configuration from anything measured so far, so
+# these variants exist to decide whether the unit's flags should be kept or
+# corrected rather than assumed either way.
+SERVER_ARGS = {
+    "unit": "--listen 0.0.0.0 --port 8188 --lowvram --bf16-vae "
+            "--preview-method auto --reserve-vram 8",
+    "unit_sage": "--listen 0.0.0.0 --port 8188 --lowvram --bf16-vae "
+                  "--preview-method auto --reserve-vram 8 --use-sage-attention",
+    "measured": "--listen 0.0.0.0 --port 8188 --bf16-vae "
+                "--preview-method auto --reserve-vram 4",
+    "measured_sage": "--listen 0.0.0.0 --port 8188 --bf16-vae "
+                     "--preview-method auto --reserve-vram 4 --use-sage-attention",
+}
+
 H3_UNET_INT8 = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 # The fp8 build on this host is named *_fp8_scaled -- there is no fp8_convrot.
 H3_UNET_FP8 = "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
@@ -131,14 +147,28 @@ if __name__ == "__main__":
 
     results = []
     for name in a.variants.split(","):
-        unet, comp = VARIANTS[name]
+        # A variant may name a server-arg profile (unit / unit_sage / measured /
+        # measured_sage) to compare launch flags, optionally combined with a
+        # checkpoint using "+", e.g. "measured_sage+fp8".
+        if "+" in name:
+            profile, ckpt = name.split("+", 1)
+            unet, comp = VARIANTS[ckpt]
+            server_args = SERVER_ARGS[profile]
+        elif name in SERVER_ARGS:
+            profile, ckpt = name, "int8"
+            unet, comp = VARIANTS[ckpt]
+            server_args = SERVER_ARGS[profile]
+        else:
+            unet, comp = VARIANTS[name]
+            server_args = DEFAULT_ARGS
         print(f"\n=== {name} (unet={unet}, compile={comp}) ===", flush=True)
+        print(f"  args: {server_args}", flush=True)
         if not has_checkpoint(unet):
             print(f"  SKIP: {unet} not on this host", flush=True)
             results.append({"variant": name, "skipped": f"{unet} missing"})
             continue
 
-        r = ssh(f"{RESTART} {DEFAULT_ARGS}", timeout=90)
+        r = ssh(f"{RESTART} {server_args}", timeout=90)
         if r.returncode != 0 or not wait_comfy():
             raise RuntimeError("ComfyUI restart failed")
 
@@ -165,8 +195,12 @@ if __name__ == "__main__":
         (HERE / a.out).write_text(json.dumps(results, indent=2))
 
     print("\n=== RESULT ===")
+    # The first successful row is the baseline everything else is divided by, so
+    # a run of server-arg profiles compares against whatever was asked for
+    # first. Hardcoding "int8" made flag-only comparisons divide by a row that
+    # was not in the run at all.
     base = next((r for r in results
-                 if r.get("variant") == "int8" and not r.get("failed")), None)
+                 if not r.get("failed") and not r.get("skipped")), None)
     for r in results:
         if r.get("skipped"):
             print(f"  {r['variant']:<14} SKIP ({r['skipped']})")
