@@ -144,6 +144,22 @@ SDXL_CHECKPOINT = "sdxl_base_1.0.safetensors"
 DEFAULT_IMAGE_MODEL = os.environ.get("BEEFTV_IMAGE_MODEL", "flux-schnell")
 
 
+# ── Env helpers ─────────────────────────────────────────────────────────────────
+# Acceleration switches are read per render, not at import time, so the process
+# does not need a restart to compare variants. A malformed value falls back to
+# the default instead of raising: a typo in an opt-in switch must never take the
+# whole video endpoint down.
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(title="BeefTV ComfyUI Proxy", version="1.0.0")
 
@@ -521,11 +537,19 @@ def build_minimax_h3_workflow(
     clip_name = os.environ.get(
         "BEEFTV_H3_CLIP", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
     )
+    # DiT weights. int8 ConvRot is the safe default; the fp8-scaled checkpoint
+    # is the same graph with per-tensor fp8 GEMMs, which is what the GB10 has
+    # native hardware for. It must never be selected implicitly — a missing or
+    # partially-downloaded checkpoint fails at UNETLoader time and turns every
+    # render into a confusing load error, so the caller opts in by env var.
+    unet_name = os.environ.get(
+        "BEEFTV_H3_UNET", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+    )
     nodes: Dict[str, Any] = {
         "1": {
             "class_type": "UNETLoader",
             "inputs": {
-                "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                "unet_name": unet_name,
                 "weight_dtype": "default",
             },
         },
@@ -572,6 +596,36 @@ def build_minimax_h3_workflow(
         # and pass cfg through. Sampling on the full base model benefits
         # from a non-zero cfg; turbo distills the model to ignore it.
         model_for_guider = ["5", 0]
+
+    # ── Optional inference accelerations ────────────────────────────────────
+    # Both are opt-in because each trades output fidelity or first-render
+    # latency for throughput, and both are inserted on the *model* edge only,
+    # so the conditioning and VAE paths are untouched.
+    cache_threshold = _env_float("BEEFTV_H3_EASYCACHE_THRESHOLD", 0.0)
+    if cache_threshold > 0:
+        # EasyCache reuses a previous step's residual when the measured change
+        # rate stays under the threshold. It is a sampler-level node, so it has
+        # to wrap the model before the guider/scheduler/sampler chain reads it.
+        nodes["20"] = {
+            "class_type": "EasyCache",
+            "inputs": {
+                "model": model_for_guider,
+                "reuse_threshold": cache_threshold,
+                "start_percent": _env_float("BEEFTV_H3_EASYCACHE_START", 0.15),
+                "end_percent": _env_float("BEEFTV_H3_EASYCACHE_END", 0.95),
+                "verbose": False,
+            },
+        }
+        model_for_guider = ["20", 0]
+
+    if _env_flag("BEEFTV_H3_TORCH_COMPILE"):
+        # Inductor compiles the DiT block graph once and reuses it. The first
+        # render pays a multi-minute compile, which is why it stays opt-in.
+        nodes["21"] = {
+            "class_type": "TorchCompileModel",
+            "inputs": {"model": model_for_guider, "backend": "inductor"},
+        }
+        model_for_guider = ["21", 0]
 
     nodes["7"] = {
         "class_type": "MiniMaxH3ImageToVideo",
