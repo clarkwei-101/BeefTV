@@ -511,6 +511,16 @@ def build_minimax_h3_workflow(
         actual_steps = max(1, min(steps or 4, 50))
     actual_cfg = 1.0 if use_turbo else cfg
 
+    # Text encoder selection. The int8 ConvRot checkpoint is the known-good
+    # default; the nvfp4 (AWQ-packed, F8_E4M3) variant trades a little encoder
+    # fidelity for ~11 GB less resident weight, which matters because the DGX
+    # Spark has one 121 GiB unified pool shared with the DeepSeek server.
+    # Only switch this after an end-to-end render proves the graph still
+    # produces real video — a silently-degraded encoder looks like a working
+    # render with wrong conditioning.
+    clip_name = os.environ.get(
+        "BEEFTV_H3_CLIP", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+    )
     nodes: Dict[str, Any] = {
         "1": {
             "class_type": "UNETLoader",
@@ -522,7 +532,7 @@ def build_minimax_h3_workflow(
         "2": {
             "class_type": "CLIPLoader",
             "inputs": {
-                "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                "clip_name": clip_name,
                 "type": "minimax",
                 "weight_dtype": "default",
             },
