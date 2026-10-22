@@ -15,6 +15,7 @@ Attention only changes the DiT math, so the same graph runs on both sides.
 import argparse
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -37,8 +38,12 @@ VARIANTS = {
 
 
 def ssh(cmd, timeout=120):
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
-                           DGX, cmd], capture_output=True, text=True, timeout=timeout)
+    # -n redirects stdin from /dev/null. Without it the remote side can keep the
+    # ssh channel's pipe open, so `communicate()` blocks until the long-running
+    # child exits instead of returning as soon as the launch is acknowledged.
+    return subprocess.run(["ssh", "-n", "-o", "BatchMode=yes",
+                           "-o", "ConnectTimeout=20", DGX, cmd],
+                          capture_output=True, text=True, timeout=timeout)
 
 
 def wait_comfy(deadline_s=240):
@@ -60,27 +65,30 @@ def queue_empty():
 
 
 def restart_comfy(argv):
-    """Stop any running server, then start one with exactly these args."""
-    ssh("pkill -f 'main.py --listen' || true", timeout=60)
-    time.sleep(6)
-    # A second instance must not come up behind the first.
-    for _ in range(30):
-        out = ssh("ss -lntp 2>/dev/null | grep -c ':8188' || true", timeout=30).stdout.strip()
-        if out in ("0", ""):
-            break
-        time.sleep(2)
+    """Restart the DGX ComfyUI with exactly these args.
+
+    The launch goes through a small script on the DGX rather than an inline
+    `setsid ... &`. Inlined, the server inherits the ssh channel's stdout and
+    `communicate()` blocks until it exits, so every restart looked like a hang.
+    The remote script exits as soon as the child is detached.
+    """
     quoted = " ".join(argv)
-    ssh(f"cd {COMFY_DIR} && setsid nohup {PY} main.py {quoted} "
-        f">> {LOG} 2>&1 < /dev/null & echo started", timeout=60)
+    r = ssh(f"/home/clarkwei/restart_comfy.sh {quoted}", timeout=90)
+    if r.returncode != 0:
+        raise RuntimeError(f"restart failed rc={r.returncode}: {r.stderr[:200]}")
     if not wait_comfy():
         raise RuntimeError("ComfyUI did not come up")
 
 
 def active_backend():
-    """Ask the running server which backend it actually loaded."""
-    out = ssh(f"tail -60 {LOG} | grep -iE 'Using (sage|pytorch|flash|.*xformers) attention' "
+    """Ask the running server which backend it actually loaded.
+
+    Reads the tail of the log *after* this restart only, because the log is
+    appended to across runs and an older startup would otherwise answer.
+    """
+    out = ssh(f"tail -80 {LOG} | grep -iE 'Using (sage|pytorch|flash|split|sub quadratic)' "
               f"| tail -1", timeout=30).stdout.strip()
-    return out
+    return re.sub(r"\x1b\[[0-9;]*m", "", out)
 
 
 def post(prompt, seed):
@@ -97,23 +105,35 @@ def post(prompt, seed):
 
 
 def run_one(prompt, seed, tag):
+    """Queue one render and time it from ComfyUI's own history record.
+
+    Timing must span at least two distinct timestamps. A prompt whose nodes are
+    all served from ComfyUI's execution cache reports a single message and
+    computes as 0.0s, which would silently poison an A/B: both sides would read
+    "instant" and the ratio would be meaningless. `wait_for_uncached` runs a
+    throwaway prompt first so the measured render actually does the work.
+    """
     pid = post(prompt, seed)
-    while True:
+    deadline = time.time() + 3600
+    while time.time() < deadline:
         time.sleep(10)
         try:
             with urllib.request.urlopen(f"{COMFY}/history/{pid}", timeout=20) as r:
                 h = json.load(r)
         except Exception:
             continue
-        if pid in h:
-            e = h[pid]
-            msgs = e["status"]["messages"]
-            ts = [m[1]["timestamp"] for m in msgs
-                  if isinstance(m[1], dict) and m[1].get("timestamp")]
-            return {"tag": tag, "prompt_id": pid,
-                    "duration_s": round((max(ts) - min(ts)) / 1000, 1),
-                    "status": e["status"]["status_str"],
-                    "backend_line": active_backend()}
+        if pid not in h:
+            continue
+        e = h[pid]
+        msgs = e["status"]["messages"]
+        ts = [m[1]["timestamp"] for m in msgs
+              if isinstance(m[1], dict) and m[1].get("timestamp")]
+        dur = (max(ts) - min(ts)) / 1000 if len(ts) >= 2 else 0.0
+        cached = any(m[0] == "execution_cached" for m in msgs)
+        return {"tag": tag, "prompt_id": pid, "duration_s": round(dur, 1),
+                "status": e["status"]["status_str"], "fully_cached": cached,
+                "n_messages": len(msgs),
+                "backend_line": active_backend()}
 
 
 if __name__ == "__main__":
@@ -130,9 +150,17 @@ if __name__ == "__main__":
         restart_comfy(VARIANTS[name])
         print(f"  backend: {active_backend()}", flush=True)
         print("  warmup...", flush=True)
-        run_one(a.prompt, a.seed, "warmup")          # excluded
+        run_one(a.prompt, a.seed, "warmup")          # loads weights, excluded
         wait_comfy(); time.sleep(15)
-        r = run_one(a.prompt, a.seed, "measured")
+        # A different seed forces the sampler to actually recompute. Reusing the
+        # warmup seed lets ComfyUI serve the whole graph from its execution
+        # cache, which reports no work and would compare as "instant".
+        r = run_one(a.prompt, a.seed + 1, "measured")
+        if r["duration_s"] <= 0:
+            raise RuntimeError(
+                f"{name}: measured render reported {r['duration_s']}s "
+                f"(fully_cached={r['fully_cached']}); refusing to record a "
+                "meaningless speedup")
         print(f"  {r['duration_s']}s  {r['status']}", flush=True)
         results.append({"variant": name, **r})
         out = pathlib.Path(__file__).parent / a.out
