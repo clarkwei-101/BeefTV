@@ -160,6 +160,26 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+# Which H3 DiT checkpoint to load.
+#
+# fp8 is preferred because it measured 1.113x faster than int8 on the DGX
+# Spark (scripts/bench_h3_variants.py). But this proxy runs on the Mac while the
+# weights live on the DGX, so it cannot stat them, and no ComfyUI HTTP endpoint
+# on this build distinguishes "absent" from "not enumerable":
+#
+#   * GET  /object_info?category=UNETLoader  -> empty options list
+#   * POST /prompt with a bare UNETLoader    -> "Prompt has no outputs",
+#     identically for a real checkpoint and for a made-up one
+#
+# Guessing wrong is expensive: a missing checkpoint fails later inside
+# UNETLoader and turns every render into a confusing load error. So the choice
+# is not probed, it is declared by whoever owns the files -- set
+# BEEFTV_H3_UNET, and deploy/scripts/ does this from the DGX side where the
+# files are actually visible. Absent that, stay on the known-good int8 build.
+H3_UNET_INT8 = "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+H3_UNET_FP8 = "minimax_h3_fl2va_pruned_fp8_scaled.safetensors"
+
+
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(title="BeefTV ComfyUI Proxy", version="1.0.0")
 
@@ -537,14 +557,7 @@ def build_minimax_h3_workflow(
     clip_name = os.environ.get(
         "BEEFTV_H3_CLIP", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
     )
-    # DiT weights. int8 ConvRot is the safe default; the fp8-scaled checkpoint
-    # is the same graph with per-tensor fp8 GEMMs, which is what the GB10 has
-    # native hardware for. It must never be selected implicitly — a missing or
-    # partially-downloaded checkpoint fails at UNETLoader time and turns every
-    # render into a confusing load error, so the caller opts in by env var.
-    unet_name = os.environ.get(
-        "BEEFTV_H3_UNET", "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
-    )
+    unet_name = os.environ.get("BEEFTV_H3_UNET", H3_UNET_INT8)
     nodes: Dict[str, Any] = {
         "1": {
             "class_type": "UNETLoader",
