@@ -160,3 +160,14 @@ AI 视频/图片生成的 12 个 Skill 集中放在 `~/.cursor/plugins/local/ai-
 - 装新 Skill 时同步加到 `README.md` 的快速开始表，否则用户找不到。
 
 Hypit 完整安装会拉 ~10GB 依赖、跑 5-15 分钟，单独派给 background worker，装完报告 frontmatter 校验 + cross-ref 检查。
+
+## 12. DGX Spark 资源调度与 H3 测量纪律
+
+DGX Spark (`192.168.1.193`) 的 ComfyUI (`:8188`) 独占整块 130 GB GPU（DS4 已于 2026-10-26 退役：`beeftv_proxy.py` 的 DeepSeek 分支、`dgx-deepseek-local` 通道、`ensure_dgx_headroom` 全部删除；文本一律走 Mac Ollama `qwen3:8b`）。约定：
+
+- 无需再做 DS4/ComfyUI 显存让位（`kill ds4-pid` / `restart-ds4.sh` 流程作废）；跑视频前只需确认 ComfyUI queue 为空。
+- ComfyUI 的启动参数以 `comfyui-dgx.service` 的 `ExecStart` 为准（该 unit 挂在 `default.target.wants/` 下，每次开机都会跑）。当前生效参数含 `--use-sage-attention`、`--reserve-vram 4`、无 `--lowvram`，并设置 `Environment=CUDA_HOME=/usr/local/cuda`（Triton 首次编译需要 `cuda_runtime.h`）。headless SSH 下操作 user systemd 需先 `export XDG_RUNTIME_DIR=/run/user/$(id -u)`。
+- 判断显存被谁占用：ComfyUI 的 `POST /free` 释放 0 bytes 即说明是别的进程持有，用 `ssh dgx 'nvidia-smi --query-compute-apps=pid,used_memory'` 确认，不要误判为渲染栈问题。
+- 测量 H3 加速时注意本机约 20% 的噪声底线（相同配置多次实测 274–449 s）。单次小于 20% 的提升只能表述为“没有变慢”；`scripts/bench_h3_variants.py` 需先 warmup、用不同 seed（相同 seed 会命中 ComfyUI execution cache，得到假的 `0.0s`），耗时取 ComfyUI `history` 时间戳而非客户端轮询。
+- 任何 H3 缓存类节点（如 EasyCache）默认不启用：上游 `Comfy-Org/ComfyUI#15326` 确认其缓存判定只看 video tensor，会让 mux 出来的音轨静默损坏（画面 SSIM 仍 0.95，音频 RMS 掉到约 0.50），修复在 0.31.0（`#15390`）。启用必须同时校验逐帧画面与音频 RMS。
+- 升级 ComfyUI 会改变渲染行为，任何加速数据都必须标明是哪个版本下测得的，升级后需全部重测（当前 0.42.0，commit `19ae172b`）。
