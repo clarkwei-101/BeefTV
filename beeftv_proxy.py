@@ -76,24 +76,10 @@ ALLOWED_ORIGINS = [
 ] or ["http://localhost:3000", "http://localhost:5173"]
 
 # ── Text routing ────────────────────────────────────────────────────────────────
-# Short, cheap requests stay on the Mac so the DGX is never blocked by chat
-# traffic. Anything long or explicitly requested goes to the DGX's DeepSeek V4.
+# ALL text goes to the Mac's Ollama (qwen3:8b). The DGX is reserved for
+# ComfyUI image/video — no DeepSeek leg (removed 2026-10-26, DS4 decommissioned).
 OLLAMA_URL = os.environ.get("BEEFTV_OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("BEEFTV_OLLAMA_MODEL", "qwen3:8b")
-DEEPSEEK_URL = os.environ.get("BEEFTV_DEEPSEEK_URL", "http://192.168.1.193:8000")
-DEEPSEEK_MODEL = os.environ.get("BEEFTV_DEEPSEEK_MODEL", "deepseek-v4-flash")
-# Rough CJK-aware token estimate above which a request is worth the DGX hop.
-LONG_PROMPT_CHARS = int(os.environ.get("BEEFTV_LONG_PROMPT_CHARS", "1200"))
-# ComfyUI caches SDXL / FLUX / MiniMax H3 weights on the DGX, which can leave the
-# DeepSeek V4 server without enough VRAM to schedule a forward pass. The request
-# is accepted but never completes, so probe /system_stats first and evict the
-# ComfyUI cache when headroom drops below this.
-DEEPSEEK_MIN_FREE_VRAM_GB = float(
-    os.environ.get("BEEFTV_DEEPSEEK_MIN_FREE_VRAM_GB", "32")
-)
-# A stalled DeepSeek hop should fall back to the Mac's Ollama quickly rather than
-# holding the chat request open for ten minutes.
-DEEPSEEK_TIMEOUT = int(os.environ.get("BEEFTV_DEEPSEEK_TIMEOUT", "180"))
 OLLAMA_TIMEOUT = int(os.environ.get("BEEFTV_OLLAMA_TIMEOUT", "180"))
 
 # ── Speech routing ──────────────────────────────────────────────────────────────
@@ -464,46 +450,6 @@ async def comfy_queue() -> list:
         r = await client.get(f"{COMFY_HOST}/queue")
     r.raise_for_status()
     return r.json()
-
-
-async def ensure_dgx_headroom(min_free_gb: float) -> None:
-    """Free ComfyUI's model cache if it is squeezing the LLM server out of VRAM.
-
-    ComfyUI keeps SDXL / FLUX / MiniMax H3 resident between jobs, and on the
-    130 GB DGX that can leave DeepSeek V4 with too little memory to run. The
-    request is accepted and then silently stalls, so release the cache up front
-    rather than waiting for a timeout. Costs one model reload on the next render.
-    """
-    if min_free_gb <= 0:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            stats = await client.get(f"{COMFY_HOST}/system_stats")
-        device = (stats.json().get("devices") or [{}])[0]
-        total = float(device.get("vram_total") or 0)
-        free = float(device.get("vram_free") or 0)
-    except Exception as exc:  # noqa: BLE001
-        log.debug(f"VRAM probe failed, skipping cache eviction: {exc}")
-        return
-
-    # Use a strict-greater-than check so a value exactly at the threshold
-    # still triggers eviction. The previous ``>=`` would treat the boundary
-    # as "enough free" and skip the flush, leaving DeepSeek unable to load.
-    if total <= 0 or free / 1e9 > min_free_gb:
-        return
-
-    log.info(
-        f"Only {free / 1e9:.1f} GB of {total / 1e9:.1f} GB VRAM free — "
-        "evicting ComfyUI's model cache so DeepSeek can load"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            await client.post(
-                f"{COMFY_HOST}/free",
-                json={"unload_models": True, "free_memory": True},
-            )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"Could not evict ComfyUI cache: {exc}")
 
 
 # ── MiniMax H3 Workflow Builder ─────────────────────────────────────────────
@@ -1595,31 +1541,9 @@ _STRIP_EMOJI_RE = re.compile(
 
 def _strip_emoji(text: str) -> str:
     """Return text with every decorative Unicode character removed.
-    Applied to every LLM output before it leaves the proxy, regardless of which
-    text backend (Ollama / DeepSeek) generated it.
+    Applied to every LLM output before it leaves the proxy.
     """
     return _STRIP_EMOJI_RE.sub("", text)
-
-
-def should_use_deepseek(messages: List[Message]) -> bool:
-    """Short chat stays on the Mac's Ollama; anything substantial moves to the
-    DGX's DeepSeek V4, which has the context length to actually handle it."""
-    total = 0
-    for message in messages:
-        content = message.content
-        if isinstance(content, str):
-            total += len(content)
-        elif isinstance(content, list):
-            # Multimodal content parts: count the text parts, and treat any
-            # non-text part (image, audio) as a substantial prompt.
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in ("text", "input_text"):
-                    total += len(str(part.get("text", "")))
-                else:
-                    total += LONG_PROMPT_CHARS
-    return total > LONG_PROMPT_CHARS
 
 
 # Qwen3 thinking-mode models write the user-visible answer into
@@ -1775,57 +1699,13 @@ async def ollama_chat_with_label(req: ChatCompletionRequest) -> tuple[Dict[str, 
     return await ollama_chat(req), f"ollama/{OLLAMA_MODEL}"
 
 
-async def deepseek_chat_with_label(req: ChatCompletionRequest) -> tuple[Dict[str, Any], str]:
-    """Same as ``ollama_chat_with_label`` but for the DGX DeepSeek V4 path."""
-    return await deepseek_chat(req), f"deepseek/{DEEPSEEK_MODEL}"
-
-
-async def deepseek_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
-    """Chat via the DGX Spark's DeepSeek V4 Flash (OpenAI-compatible)."""
-    await ensure_dgx_headroom(DEEPSEEK_MIN_FREE_VRAM_GB)
-    payload: Dict[str, Any] = {
-        "model": DEEPSEEK_MODEL,
-        "messages": [openai_message_payload(m) for m in req.messages],
-        "stream": False,
-    }
-    if req.temperature is not None:
-        payload["temperature"] = req.temperature
-    if req.max_tokens:
-        payload["max_tokens"] = req.max_tokens
-    elif req.max_completion_tokens:
-        payload["max_tokens"] = req.max_completion_tokens
-    if req.top_p is not None:
-        payload["top_p"] = req.top_p
-    if req.stop is not None:
-        payload["stop"] = req.stop
-    if req.presence_penalty is not None:
-        payload["presence_penalty"] = req.presence_penalty
-    if req.frequency_penalty is not None:
-        payload["frequency_penalty"] = req.frequency_penalty
-    if req.response_format is not None:
-        payload["response_format"] = req.response_format
-    # Tool declarations must reach the model, otherwise the assistant host
-    # can never call a canvas operation.
-    if req.tools:
-        payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
-        if req.tool_choice is not None:
-            payload["tool_choice"] = req.tool_choice
-    async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT) as client:
-        resp = await client.post(f"{DEEPSEEK_URL}/v1/chat/completions", json=payload)
-    resp.raise_for_status()
-    # The upstream DeepSeek response is already OpenAI-shaped; return it
-    # directly. The route handler attaches ``x-beeftv-backend`` as a response
-    # header rather than mutating the body.
-    return resp.json()
-
-
-async def _text_sse_stream(req, want_deepseek, backend):
+async def _text_sse_stream(req, backend):
     """Yield OpenAI chat-completion SSE chunks for text models.
 
     The previous implementation only streamed for video models, and any text
     request with stream=true silently fell back to a buffered response. This
-    generator bridges Ollama (NDJSON) and DeepSeek (OpenAI streaming) into the
-    single OpenAI SSE shape that the BeefTV web client expects.
+    generator bridges Ollama (NDJSON) into the single OpenAI SSE shape that
+    the BeefTV web client expects.
     """
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created = int(datetime.now().timestamp())
@@ -1865,118 +1745,55 @@ async def _text_sse_stream(req, want_deepseek, backend):
         }
         yield "data: " + json.dumps(chunk) + "\n\n"
 
-    if want_deepseek:
-        try:
-            await ensure_dgx_headroom(DEEPSEEK_MIN_FREE_VRAM_GB)
-        except Exception as exc:
-            log.warning(f"VRAM probe failed; proceeding anyway: {exc}")
-        payload = {
-            "model": DEEPSEEK_MODEL,
-            "messages": [openai_message_payload(m) for m in req.messages],
-            "stream": True,
-        }
-        if req.temperature is not None:
-            payload["temperature"] = req.temperature
-        if req.max_tokens:
-            payload["max_tokens"] = req.max_tokens
-        elif req.max_completion_tokens:
-            payload["max_tokens"] = req.max_completion_tokens
-        if req.top_p is not None:
-            payload["top_p"] = req.top_p
-        if req.stop is not None:
-            payload["stop"] = req.stop
-        if req.response_format is not None:
-            payload["response_format"] = req.response_format
-        # Tool declarations must be forwarded in streaming mode too. Without
-        # them the model answers the assistant host in prose instead of
-        # emitting native tool calls, so the canvas is never touched.
-        if req.tools:
-            payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
-            if req.tool_choice is not None:
-                payload["tool_choice"] = req.tool_choice
-        async with httpx.AsyncClient(timeout=DEEPSEEK_TIMEOUT) as client:
-            async with client.stream(
-                "POST", f"{DEEPSEEK_URL}/v1/chat/completions", json=payload
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith("data: "):
-                        data = line[6:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        for choice in obj.get("choices", []):
-                            raw_delta = choice.get("delta", {}) or {}
-                            delta = raw_delta.get("content") or ""
-                            if delta:
-                                async for piece in emit(delta):
-                                    yield piece
-                            # Tool-call deltas carry the function name and
-                            # argument fragments. They must reach the client
-                            # verbatim or the agent host never sees a call.
-                            tool_deltas = raw_delta.get("tool_calls")
-                            if tool_deltas:
-                                async for piece in emit_delta({"tool_calls": tool_deltas}):
-                                    yield piece
-                            upstream_finish = choice.get("finish_reason")
-                            if upstream_finish:
-                                async for piece in emit_delta({}, finish=upstream_finish):
-                                    yield piece
-    else:
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": [openai_message_payload(m) for m in req.messages],
-            "stream": True,
-        }
-        if req.temperature is not None:
-            payload["options"] = {"temperature": req.temperature}
-        if req.max_tokens:
-            payload["options"] = {**payload.get("options", {}), "num_predict": req.max_tokens}
-        # Tool declarations must be forwarded in streaming mode too, otherwise
-        # the model answers the assistant host in prose instead of calling a
-        # canvas operation.
-        if req.tools:
-            payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
-        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-            async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as resp:
-                resp.raise_for_status()
-                tool_call_index = 0
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    content = obj.get("message", {}).get("content")
-                    if content:
-                        async for piece in emit(content):
-                            yield piece
-                    # Ollama streams tool calls as complete objects; convert them
-                    # into the OpenAI tool_calls delta shape.
-                    for call in obj.get("message", {}).get("tool_calls") or []:
-                        function = call.get("function", {}) if isinstance(call, dict) else {}
-                        delta = {
-                            "tool_calls": [{
-                                "index": tool_call_index,
-                                "id": call.get("id", f"call_{tool_call_index}") if isinstance(call, dict) else f"call_{tool_call_index}",
-                                "type": "function",
-                                "function": {
-                                    "name": function.get("name", ""),
-                                    "arguments": tool_call_arguments(function.get("arguments")),
-                                },
-                            }],
-                        }
-                        tool_call_index += 1
-                        async for piece in emit_delta(delta):
-                            yield piece
-                    if obj.get("done"):
-                        break
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [openai_message_payload(m) for m in req.messages],
+        "stream": True,
+    }
+    if req.temperature is not None:
+        payload["options"] = {"temperature": req.temperature}
+    if req.max_tokens:
+        payload["options"] = {**payload.get("options", {}), "num_predict": req.max_tokens}
+    # Tool declarations must be forwarded in streaming mode too, otherwise
+    # the model answers the assistant host in prose instead of calling a
+    # canvas operation.
+    if req.tools:
+        payload["tools"] = [tool.model_dump(exclude_none=True) for tool in req.tools]
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+        async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as resp:
+            resp.raise_for_status()
+            tool_call_index = 0
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = obj.get("message", {}).get("content")
+                if content:
+                    async for piece in emit(content):
+                        yield piece
+                # Ollama streams tool calls as complete objects; convert them
+                # into the OpenAI tool_calls delta shape.
+                for call in obj.get("message", {}).get("tool_calls") or []:
+                    function = call.get("function", {}) if isinstance(call, dict) else {}
+                    delta = {
+                        "tool_calls": [{
+                            "index": tool_call_index,
+                            "id": call.get("id", f"call_{tool_call_index}") if isinstance(call, dict) else f"call_{tool_call_index}",
+                            "type": "function",
+                            "function": {
+                                "name": function.get("name", ""),
+                                "arguments": tool_call_arguments(function.get("arguments")),
+                            },
+                        }],
+                    }
+                    tool_call_index += 1
+                    async for piece in emit_delta(delta):
+                        yield piece
+                if obj.get("done"):
+                    break
     async for piece in emit("", finish="stop"):
         yield piece
     yield "data: [DONE]\n\n"
@@ -2022,17 +1839,6 @@ async def health():
     except Exception as exc:  # noqa: BLE001
         backends["mac_ollama"] = {"status": "error", "url": OLLAMA_URL, "detail": str(exc)}
 
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{DEEPSEEK_URL}/v1/models")
-        backends["dgx_deepseek"] = {
-            "status": "ok" if resp.status_code == 200 else "error",
-            "url": DEEPSEEK_URL,
-            "model": DEEPSEEK_MODEL,
-        }
-    except Exception as exc:  # noqa: BLE001
-        backends["dgx_deepseek"] = {"status": "error", "url": DEEPSEEK_URL, "detail": str(exc)}
-
     voices = await asyncio.to_thread(list_piper_voices)
     backends["mac_piper"] = {
         "status": "ok" if voices else "no_voices",
@@ -2073,7 +1879,6 @@ async def list_models():
                 _model_entry(FLUX_UNET.replace(".safetensors", "").replace("flux1-", "flux-"), "black-forest-labs"),
                 _model_entry("sdxl-base", "stabilityai"),
                 _model_entry(OLLAMA_MODEL, "ollama"),
-                _model_entry(DEEPSEEK_MODEL, "deepseek"),
                 _model_entry("piper", "rhasspy"),
             ],
         }
@@ -2354,23 +2159,18 @@ async def chat_completions(req: ChatCompletionRequest):
     model_id = (req.model or "").lower()
 
     # ── Text routing ──
+    # ALL text goes to the Mac's Ollama (qwen3:8b). The DGX DeepSeek leg was
+    # removed with the DS4 decommission — the DGX is reserved for ComfyUI.
+    # "deepseek" stays in the match list only so stale callers naming the old
+    # model still land on Ollama instead of falling through to the video path.
     if any(key in model_id for key in ("qwen", "deepseek", "llama", "gpt", "auto", "text")):
-        want_deepseek = "deepseek" in model_id
-        if not want_deepseek and model_id not in ("auto", "text"):
-            # An explicitly named local model stays local.
-            want_deepseek = False
-        elif should_use_deepseek(req.messages):
-            want_deepseek = True
-
         # SSE streaming path. The previous behaviour ignored ``stream: true``
         # for text models and always returned a single JSON blob, which the
         # frontend's streaming reader silently swallowed.
         if req.stream:
-            backend = (
-                f"deepseek/{DEEPSEEK_MODEL}" if want_deepseek else f"ollama/{OLLAMA_MODEL}"
-            )
+            backend = f"ollama/{OLLAMA_MODEL}"
             return StreamingResponse(
-                _text_sse_stream(req, want_deepseek, backend),
+                _text_sse_stream(req, backend),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -2380,19 +2180,10 @@ async def chat_completions(req: ChatCompletionRequest):
             )
 
         try:
-            result, backend_label = await (
-                deepseek_chat_with_label(req)
-                if want_deepseek
-                else ollama_chat_with_label(req)
-            )
+            result, backend_label = await ollama_chat_with_label(req)
         except httpx.HTTPError as exc:
-            log.error(f"Text backend failed (deepseek={want_deepseek}): {exc}")
-            # One leg being down should not take the whole chat surface with it.
-            if want_deepseek:
-                log.warning("DeepSeek unavailable — falling back to the local Ollama")
-                result, backend_label = await ollama_chat_with_label(req)
-            else:
-                raise HTTPException(status_code=502, detail=f"Text backend error: {exc}")
+            log.error(f"Text backend failed: {exc}")
+            raise HTTPException(status_code=502, detail=f"Text backend error: {exc}")
         # Surface which leg served the request as a response header. The body
         # stays exactly OpenAI-shaped so LiteLLM / LangChain do not choke on
         # unknown keys.
