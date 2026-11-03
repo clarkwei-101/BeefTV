@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -107,27 +108,54 @@ func (s *Store) Run(ctx context.Context, req RunRequest, fn func(tx *gorm.DB) ([
 	}
 	var outcome RunOutcome
 	err := db.Transaction(func(tx *gorm.DB) error {
-		record := model.AgentOpRecord{OpID: req.OpID, UserID: req.UserID, Op: req.Op,
-			PayloadHash: req.PayloadHash, Status: "running", TurnID: strings.TrimSpace(req.TurnID)}
-		if err := tx.Create(&record).Error; err != nil {
-			if !isDuplicateKey(err) {
-				return AsError(err)
+		// 幂等回读优先：先查已有回执，再决定要不要写入。
+		//
+		// 之前是「先 INSERT，撞唯一键后再回读」。撞键本身无害（回读成功后照常
+		// 回放），但 GORM 会把这条已被业务代码接住的错误按 ERROR 级别写进日志。
+		// 恢复任务每轮重扫全部已成功任务，于是同一个 opId 每 5 秒刷一条错误日志，
+		// 一次线上运行就能写出几十 MB 的日志并把真正的错误淹没。
+		existing, found, findErr := s.findReceipt(tx, req)
+		if findErr != nil {
+			return AsError(findErr)
+		}
+		if found {
+			replay, err := s.replayReceipt(tx, req, existing, &outcome)
+			if err != nil {
+				return err
 			}
-			var existing model.AgentOpRecord
-			if findErr := tx.Where("user_id = ? AND op_id = ?", req.UserID, req.OpID).First(&existing).Error; findErr != nil {
-				return AsError(err)
+			if replay {
+				return nil
 			}
-			if existing.Status != "succeeded" {
-				return Conflict("operation_in_progress",
-					"同一操作正在执行或上次未成功，未回放结果", map[string]any{"opId": req.OpID, "status": existing.Status})
+			// 陈旧租约被接管：继续走真正的执行路径。
+			if err := s.takeOverReceipt(tx, req, existing); err != nil {
+				return err
 			}
-			if !payloadHashAccepted(existing.PayloadHash, req) || existing.Op != req.Op {
-				return Conflict("operation_id_reused_with_different_payload",
-					"同一操作 ID 已用于不同的请求内容；请换用新的操作 ID",
-					map[string]any{"opId": req.OpID, "existingOp": existing.Op})
+		} else {
+			record := model.AgentOpRecord{OpID: req.OpID, UserID: req.UserID, Op: req.Op,
+				PayloadHash: req.PayloadHash, Status: "running", TurnID: strings.TrimSpace(req.TurnID)}
+			if err := tx.Create(&record).Error; err != nil {
+				if !isDuplicateKey(err) {
+					return AsError(err)
+				}
+				// 并发写入同一 opId：重新回读一次再决定。
+				existing, found, findErr = s.findReceipt(tx, req)
+				if findErr != nil {
+					return AsError(findErr)
+				}
+				if !found {
+					return AsError(err)
+				}
+				replay, replayErr := s.replayReceipt(tx, req, existing, &outcome)
+				if replayErr != nil {
+					return replayErr
+				}
+				if replay {
+					return nil
+				}
+				if err := s.takeOverReceipt(tx, req, existing); err != nil {
+					return err
+				}
 			}
-			outcome = RunOutcome{Result: []byte(existing.ResultJSON), Replayed: true}
-			return nil
 		}
 		if strings.TrimSpace(req.TurnID) != "" {
 			if req.TurnGuard == nil {
@@ -156,6 +184,64 @@ func (s *Store) Run(ctx context.Context, req RunRequest, fn func(tx *gorm.DB) ([
 		return RunOutcome{}, AsError(err)
 	}
 	return outcome, nil
+}
+
+// receiptLeaseTimeout 是一次写操作的租约上限。
+//
+// 回执与业务写入在同一个事务里提交，正常情况下不会出现「running」残留行；
+// 但如果进程在提交前被强杀、或结算写入意外没有命中回执行，那条 running 回执会
+// 永久挡住同一个 opId：后续每次重试都只能拿到 operation_in_progress 冲突。
+// 超过租约上限的 running 回执视为陈旧，由后来的调用接管重做。
+const receiptLeaseTimeout = 10 * time.Minute
+
+// findReceipt 读取某个 opId 的回执行。找不到返回 found=false，不算错误。
+func (s *Store) findReceipt(tx *gorm.DB, req RunRequest) (model.AgentOpRecord, bool, error) {
+	var existing model.AgentOpRecord
+	err := tx.Where("user_id = ? AND op_id = ?", req.UserID, req.OpID).First(&existing).Error
+	if err == nil {
+		return existing, true, nil
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.AgentOpRecord{}, false, nil
+	}
+	return model.AgentOpRecord{}, false, err
+}
+
+// replayReceipt 判断已有回执能否回放。能回放时写入 outcome 并返回 true。
+func (s *Store) replayReceipt(tx *gorm.DB, req RunRequest, existing model.AgentOpRecord, outcome *RunOutcome) (bool, error) {
+	if existing.Status != "succeeded" {
+		if existing.Status == "running" && existing.Op == req.Op && receiptLeaseExpired(existing) {
+			// 陈旧租约：交给调用方接管重做。
+			return false, nil
+		}
+		return false, Conflict("operation_in_progress",
+			"同一操作正在执行或上次未成功，未回放结果", map[string]any{"opId": req.OpID, "status": existing.Status})
+	}
+	if !payloadHashAccepted(existing.PayloadHash, req) || existing.Op != req.Op {
+		return false, Conflict("operation_id_reused_with_different_payload",
+			"同一操作 ID 已用于不同的请求内容；请换用新的操作 ID",
+			map[string]any{"opId": req.OpID, "existingOp": existing.Op})
+	}
+	*outcome = RunOutcome{Result: []byte(existing.ResultJSON), Replayed: true}
+	return true, nil
+}
+
+// takeOverReceipt 接管一条陈旧的 running 回执：把回执重新标记为本次请求并刷新租约。
+func (s *Store) takeOverReceipt(tx *gorm.DB, req RunRequest, existing model.AgentOpRecord) error {
+	if err := tx.Model(&model.AgentOpRecord{}).
+		Where("user_id = ? AND op_id = ? AND status = ?", req.UserID, req.OpID, "running").
+		Updates(map[string]any{"payload_hash": req.PayloadHash, "updated_at": time.Now()}).Error; err != nil {
+		return AsError(err)
+	}
+	return nil
+}
+
+// receiptLeaseExpired 判断 running 回执是否已超过租约上限。
+func receiptLeaseExpired(existing model.AgentOpRecord) bool {
+	if existing.UpdatedAt.IsZero() {
+		return true
+	}
+	return time.Since(existing.UpdatedAt) > receiptLeaseTimeout
 }
 
 // RunDomain 把当前事务绑成 Domain 再执行：业务端口拿不到 *gorm.DB。

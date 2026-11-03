@@ -7,7 +7,6 @@ const root = resolve(import.meta.dir, "..");
 describe("local-only source boundary", () => {
     test("hosted UI and API entrypoints are physically absent", () => {
         for (const path of [
-            "src/services/api/auth.ts",
             "src/services/api/wallet.ts",
             "src/services/api/announcements.ts",
             "src/services/user-data-sync.ts",
@@ -26,6 +25,16 @@ describe("local-only source boundary", () => {
 			"src/services/api/system-update.ts",
 			"src/styles/admin-ui.css",
         ]) expect(existsSync(resolve(root, path))).toBe(false);
+    });
+
+    // 公网形态有账号系统（后端 /api/auth/*），但它只能是本机后端这一层合同：
+    // 不得引入托管版身份、钱包、订单等云端接口。
+    test("account surface stays on the local auth contract", () => {
+        const authApi = readFileSync(resolve(root, "src/services/api/auth.ts"), "utf8");
+        expect(authApi).toContain('"/auth/status"');
+        expect(authApi).toContain('"/auth/login"');
+        expect(authApi).toContain('"/auth/register"');
+        expect(authApi).not.toMatch(/wallet|billing|credits|oauth|user_identit/i);
     });
 
     test("workspace startup depends only on the local contract", () => {

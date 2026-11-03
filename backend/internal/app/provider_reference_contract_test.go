@@ -62,8 +62,29 @@ func TestWanLocalReferencesUseVerifiedInlineContract(t *testing.T) {
 	}
 }
 
-func TestInstalledMediaContractOverridesLegacyGuess(t *testing.T) {
+// 本机桥接（loopback 上游）与后端同机，内嵌素材可以直接被桥接进程解码，
+// 不需要公网可达的素材地址；公网和私网渠道保持"必须公网素材地址"的规则。
+func TestLoopbackUpstreamAllowsInlineReferenceMedia(t *testing.T) {
 	ctx := withProtocolRegistry(context.Background(), loadOfficialFallbackRegistry())
+	local := providerMediaHydrationPolicyFor(ctx, canvasGenerationInput{Config: providerConfig{InterfaceType: "newapi-channel-2", Model: "minimax-h3", BaseURL: "http://127.0.0.1:8198"}})
+	if local.RequireURL {
+		t.Fatalf("loopback upstream still requires public media URLs: %#v", local)
+	}
+	byName := providerMediaHydrationPolicyFor(ctx, canvasGenerationInput{Config: providerConfig{InterfaceType: "newapi-channel-2", Model: "minimax-h3", BaseURL: "http://localhost:8198"}})
+	if byName.RequireURL {
+		t.Fatalf("localhost upstream still requires public media URLs: %#v", byName)
+	}
+	remote := providerMediaHydrationPolicyFor(ctx, canvasGenerationInput{Config: providerConfig{InterfaceType: "newapi-channel-2", Model: "minimax-h3", BaseURL: "https://example.com"}})
+	if !remote.RequireURL {
+		t.Fatalf("public upstream lost the public media URL requirement: %#v", remote)
+	}
+	private := providerMediaHydrationPolicyFor(ctx, canvasGenerationInput{Config: providerConfig{InterfaceType: "newapi-channel-2", Model: "minimax-h3", BaseURL: "http://192.168.1.193:8198"}})
+	if !private.RequireURL {
+		t.Fatalf("private upstream inherited the loopback exemption: %#v", private)
+	}
+}
+
+func TestInstalledMediaContractOverridesLegacyGuess(t *testing.T) {	ctx := withProtocolRegistry(context.Background(), loadOfficialFallbackRegistry())
 	for _, protocol := range []string{"grok-image", "chat-completion", "openai-response", "claude-api"} {
 		policy := providerMediaHydrationPolicyFor(ctx, canvasGenerationInput{Config: providerConfig{InterfaceType: protocol}})
 		if policy.RequireURL || !policy.PreferURL {

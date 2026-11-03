@@ -1,0 +1,27 @@
+# ─── Cloudflare Tunnel credentials ───────────────────────────────────────────
+# Run once to create the tunnel:
+#   cloudflared tunnel create beeftv-local
+#   cloudflared tunnel credentials beeftv-local
+# Fill in the outputs below.
+
+tunnel: <TUNNEL-ID>           # e.g. a1b2c3d4-5678-90ab-cdef-1234567890ab
+credentials-file: /Users/yahweh/.cloudflared/<TUNNEL-ID>.json
+
+# ─── Ingress: what traffic goes where ─────────────────────────────────────────
+# Only the web (port 3000) is exposed publicly.
+# Backend (8080) and proxy (8198) are NEVER reachable from the internet.
+ingress:
+  - hostname: beeftv.<YOUR_DOMAIN>     # ← replace with your real domain
+    service: http://localhost:3000
+    originRequest:
+      noTLSVerify: false
+      connectTimeout: 30
+      tlsTimeout: 10
+
+  # Catch-all: anything else → block
+  - service: http_status:403
+
+# ─── Optional: HTTP → HTTPS redirect ─────────────────────────────────────────
+# Uncomment when DNS is pointed at Cloudflare and Full/Strict SSL is active.
+# transport-lifecycle:
+#   tls-termination: true

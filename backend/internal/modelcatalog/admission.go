@@ -41,28 +41,36 @@ type TaskSelectResult struct {
 func SelectTaskModel(req TaskSelectRequest, lookup TaskSelectLookup) (TaskSelectResult, error) {
 	input := req.Input
 	customChannelTask := TaskInputUsesCustomChannel(input)
+	logicalModelID := strings.TrimSpace(req.LogicalModelID)
+	// Local model IDs (e.g. "dgx-flux-local::flux-schnell") bypass the system
+	// channel catalog: hydrate the config with the proxy endpoint and return
+	// so execution can proceed with the raw config from the frontend.
+	//
+	// This check has to run before the frontend-model branch below: the
+	// frontend catalog only knows hosted logical models, so routing a local ID
+	// through ResolveLogical rejects it with "所选模型不可用" and the local
+	// proxy models become unusable whenever FeatureFrontendModels is on.
+	if logicalModelID != "" {
+		if localResult, ok := resolveLocalModelSelection(logicalModelID, input, req.Type, req.Operation); ok {
+			return TaskSelectResult{Input: localResult}, nil
+		}
+	}
 	if req.FrontendEnabled && !TaskInputUsesSystemChannel(input) && !customChannelTask {
-		if strings.TrimSpace(req.LogicalModelID) == "" {
+		if logicalModelID == "" {
 			return TaskSelectResult{}, InvalidModelSelection("前台模型模式下必须指定 logicalModelId")
 		}
 		if lookup.ResolveLogical == nil {
 			return TaskSelectResult{}, InvalidModelSelection("前台模型模式下必须指定 logicalModelId")
 		}
 		intent := ModelRequestIntentFromTaskInput(input, req.Type, req.Operation)
-		routed, err := lookup.ResolveLogical(req.LogicalModelID, intent)
+		routed, err := lookup.ResolveLogical(logicalModelID, intent)
 		if err != nil {
 			return TaskSelectResult{}, err
 		}
 		return TaskSelectResult{Input: ApplyRoutedProviderSelection(input, routed), Routed: routed}, nil
 	}
 
-	if strings.TrimSpace(req.LogicalModelID) != "" {
-		// Local model IDs (e.g. "dgx-flux-local::flux-schnell") bypass the system
-		// channel catalog: hydrate the config with the proxy endpoint and return
-		// so execution can proceed with the raw config from the frontend.
-		if localResult, ok := resolveLocalModelSelection(req.LogicalModelID, input, req.Type, req.Operation); ok {
-			return TaskSelectResult{Input: localResult}, nil
-		}
+	if logicalModelID != "" {
 		// Only reject if it was a hosted-style logical model ID that genuinely
 		// failed the snapshot lookup — not for the local-model format.
 		return TaskSelectResult{}, ModelCatalogMismatch("模型目录已更新，请重新选择")
@@ -357,9 +365,22 @@ func ChannelAPIFormatForProtocol(channelDefault string, protocol model.ChannelIn
 // LocalProxyBaseURLEnv overrides where local channels reach beeftv_proxy.py.
 const LocalProxyBaseURLEnv = "CANVAS_LOCAL_PROXY_BASE_URL"
 
+// LocalProxyTokenEnv carries the shared secret that beeftv_proxy.py enforces
+// on /v1/* when BEEFTV_PROXY_TOKEN is set. The deploy script writes the same
+// token into the local channel apiKey, but admission must also work when the
+// channel config predates token enforcement — read the server env as fallback
+// so generation doesn't silently use the sentinel and get 401'd upstream.
+const LocalProxyTokenEnv = "BEEFTV_PROXY_TOKEN"
+
 // DefaultLocalProxyBaseURL is an IPv4 literal on purpose: beeftv_proxy.py binds
 // 0.0.0.0 only, so "localhost" resolves to ::1 first and every call is refused.
 const DefaultLocalProxyBaseURL = "http://127.0.0.1:8198"
+
+// localProxyToken returns the proxy shared secret, or "" when token auth is
+// not configured (proxy runs open).
+func localProxyToken() string {
+	return strings.TrimSpace(os.Getenv(LocalProxyTokenEnv))
+}
 
 // localProxyBaseURL returns the configured local proxy endpoint, falling back to
 // the IPv4-safe default. Trailing slashes are trimmed so callers can append paths.
@@ -410,12 +431,8 @@ func resolveLocalModelSelection(logicalModelID string, input map[string]any, tas
 		// MiniMax H3 / Wan 2.1 text-to-video on DGX Spark ComfyUI
 		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
-	case "dgx-deepseek-local":
-		// DeepSeek R1 long-context text on DGX Spark
-		baseURL = localProxyBaseURL()
-		apiFormat = "openai"
 	case "mac-ollama-local":
-		// Ollama on Mac Studio for local text
+		// Ollama on Mac Studio for local text (qwen3:8b，移除 DS4 后接管全部文本)
 		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
 	case "mac-piper-local":
@@ -463,13 +480,18 @@ func resolveLocalModelSelection(logicalModelID string, input map[string]any, tas
 	cfg["apiFormat"] = apiFormat
 	cfg["model"] = modelKey
 
-	// Local proxies (beeftv_proxy.py on this Mac) don't validate the
-	// Authorization header — they just route by model — but the executor's
-	// validatePreparedInput rejects an empty apiKey with "后端生成任务缺少
-	// Base URL、API Key 或模型名". Inject a sentinel so the request reaches
-	// the upstream; the proxy ignores the value.
+	// Local proxies (beeftv_proxy.py on this Mac) validate the shared secret on
+	// /v1/* when BEEFTV_PROXY_TOKEN is set — they just route by model, but the
+	// executor's validatePreparedInput rejects an empty apiKey with "后端生成任务缺少
+	// Base URL、API Key 或模型名". Prefer the channel's own apiKey (the deploy
+	// script writes the real token there); fall back to the server env token;
+	// only as a last resort use the sentinel for a token-less proxy.
 	if strings.TrimSpace(admissionString(cfg["apiKey"])) == "" {
-		cfg["apiKey"] = "local-proxy-no-auth"
+		if token := localProxyToken(); token != "" {
+			cfg["apiKey"] = token
+		} else {
+			cfg["apiKey"] = "local-proxy-no-auth"
+		}
 	}
 
 	// Set interface type based on capability. The local proxy (beeftv_proxy.py)

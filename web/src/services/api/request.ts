@@ -1,6 +1,7 @@
 import axios, { type AxiosRequestConfig, type AxiosResponse } from "axios";
 
 import { assertUserScope, isUserScopeAbandonedError, type CapturedUserScope } from "@/lib/user-scope-guard";
+import { readAuthToken } from "@/services/api/auth-token";
 
 export type ApiParams = Record<string, string | string[] | number | number[] | undefined>;
 
@@ -137,8 +138,37 @@ function assertExpectedHttpScope(config?: { expectedScope?: CapturedUserScope })
 
 apiClient.interceptors.request.use((config) => {
     assertExpectedHttpScope(config as HttpRequestConfig);
+    try {
+        const token = readAuthToken();
+        if (token && !config.headers?.Authorization) {
+            config.headers = config.headers ?? {};
+            (config.headers as Record<string, string>).Authorization = `Bearer ${token}`;
+        }
+    } catch {
+        // 读取不到 token 时跳过：请求以匿名身份发出，由后端返回 401。
+    }
     return config;
 });
+
+// 401 会话失效时广播一次，供登录守卫跳转。模块不直接 import 路由，避免循环依赖。
+let authExpiredNotified = false;
+apiClient.interceptors.response.use(
+    (response) => {
+        if (response.status !== 401) authExpiredNotified = false;
+        return response;
+    },
+    (error) => {
+        if (error?.response?.status === 401 && !authExpiredNotified) {
+            authExpiredNotified = true;
+            try {
+                window.dispatchEvent(new CustomEvent("beeftv:auth-expired"));
+            } catch {
+                // 忽略：非浏览器环境无 window。
+            }
+        }
+        return Promise.reject(error);
+    },
+);
 
 async function send<T>(method: string, url: string, data?: unknown, config?: HttpRequestConfig) {
     assertExpectedHttpScope(config);

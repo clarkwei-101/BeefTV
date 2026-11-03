@@ -74,8 +74,10 @@ func TestCurrentUserResolvesWorkspaceOwnerWithoutCookie(t *testing.T) {
 	if response.Code != http.StatusOK || response.Body.String() != "local" {
 		t.Fatalf("status = %d, body = %q; want cookie-free local owner", response.Code, response.Body.String())
 	}
-	if db.Migrator().HasTable("auth_sessions") {
-		t.Fatal("auth_sessions table exists in local workspace schema")
+	// 公网账号体系（v14 迁移）要求 auth_sessions 表存在：它是登录会话存储，
+	// 与本地资源归属的 User 投影互不干扰。cookie-free 断言已在上面覆盖。
+	if !db.Migrator().HasTable("auth_sessions") {
+		t.Fatal("auth_sessions table missing: public account sessions have nowhere to persist")
 	}
 }
 

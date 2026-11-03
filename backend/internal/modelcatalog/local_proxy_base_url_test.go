@@ -41,7 +41,7 @@ func TestResolveLocalModelSelectionUsesReachableBaseURL(t *testing.T) {
 	t.Setenv(LocalProxyBaseURLEnv, "")
 	channels := []string{
 		"dgx-flux-local", "dgx-sdxl-local", "dgx-minimax-local", "minimax-h3-local",
-		"dgx-wan-local", "dgx-deepseek-local", "mac-ollama-local", "mac-piper-local",
+		"dgx-wan-local", "mac-ollama-local", "mac-piper-local",
 	}
 	for _, channel := range channels {
 		t.Run(channel, func(t *testing.T) {

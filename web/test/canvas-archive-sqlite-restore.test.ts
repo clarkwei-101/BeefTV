@@ -36,6 +36,7 @@ const { restoreCanvasArchive, assertRestoredCanvasMatches } = await import("@/li
 const { openCanvasArchive } = await import("@/lib/canvas/canvas-export");
 const { createZip } = await import("@/lib/zip");
 const { apiClient, configureApiRuntime, http } = await import("@/services/api/request");
+const { loginAccount, registerAccount, writeAuthToken } = await import("@/services/api/auth");
 const { resetCanvasOperationJournalMemory } = await import("@/services/canvas-operation-journal");
 const { syncLocalCanvasProjectToBackend, readLocalCanvasProjectFromBackend } = await import("@/services/local-workspace-repository");
 const { useAssetStore } = await import("@/stores/use-asset-store");
@@ -133,6 +134,21 @@ async function stopServer(server: RunningServer | undefined) {
 function connect(port: number) {
     configureApiRuntime(`http://127.0.0.1:${port}/api`, "");
     apiClient.defaults.timeout = 20_000;
+}
+
+// cmd/server 跑的是 server profile，所有 /api 写读都要带会话 token。
+// 首个账号直接注册，重启后同一份数据目录里账号还在，就改成登录。
+const TEST_ACCOUNT = { username: "archive-restore", password: "archive-restore-pass" };
+
+async function authenticate(port: number) {
+    connect(port);
+    let result;
+    try {
+        result = await registerAccount(TEST_ACCOUNT.username, TEST_ACCOUNT.password);
+    } catch {
+        result = await loginAccount(TEST_ACCOUNT.username, TEST_ACCOUNT.password);
+    }
+    writeAuthToken(result.token);
 }
 
 async function listProjects() {
@@ -260,6 +276,7 @@ beforeEach(() => {
 });
 afterEach(() => {
     configureApiRuntime("/api", "");
+    writeAuthToken(null);
     resetStores();
     globalThis.window = originalWindow;
 });
@@ -273,7 +290,7 @@ test("valid archive restores into isolated SQLite, survives backend restart, and
     let server: RunningServer | undefined;
     try {
         server = await startServer(dataDir);
-        connect(server.port);
+        await authenticate(server.port);
         resetStores();
         const zip = await fixtureZip();
         const result = await restoreCanvasArchive(zip);
@@ -316,7 +333,7 @@ test("valid archive restores into isolated SQLite, survives backend restart, and
         await stopServer(server);
         for (const cache of browserCaches.values()) cache.clear();
         server = await startServer(dataDir);
-        connect(server.port);
+        await authenticate(server.port);
         resetStores();
         const restartedFolders = await listFolders();
         expect(await readResourceBytes(restartedFolders[0].coverResourceId!)).toEqual(folderCoverBytes);
@@ -355,7 +372,7 @@ test("canonical readback still rejects lost nodes, connections, or title and rol
     let server: RunningServer | undefined;
     try {
         server = await startServer(dataDir);
-        connect(server.port);
+        await authenticate(server.port);
         resetStores();
         const zip = await fixtureZip();
         for (const patch of [{ nodes: [] }, { connections: [] }, { title: "" }]) {
@@ -382,7 +399,7 @@ test("missing archive entry and persist failure do not create a saved SQLite can
     let server: RunningServer | undefined;
     try {
         server = await startServer(dataDir);
-        connect(server.port);
+        await authenticate(server.port);
         resetStores();
         const missing = await createZip([{
             name: "projects.json",

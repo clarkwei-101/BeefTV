@@ -22,7 +22,10 @@ test("local workspace bootstrap is the product startup contract", () => {
     expect(hydrator).toContain("applySession: applyUserSession");
     expect(hydrator).toContain("restoreModelConfig: hydrateLocalModelConfig");
     expect(workspaceApi).toContain('"/workspace/bootstrap"');
-    expect(router).not.toContain('path: "/login"');
+    // 公网形态有登录页，但桌面本机形态必须免登录：守卫在 profile === "desktop"
+    // 时直接放行，注册是登录页的一种模式而不是独立路由。
+    expect(router).toContain('path: "/login"');
+    expect(router).toContain('profile === "desktop"');
     expect(router).not.toContain('path: "/register"');
     expect(router).not.toContain("AuthScene");
     expect(router).toContain("createWorkspaceRouter");

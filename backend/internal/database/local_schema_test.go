@@ -275,10 +275,14 @@ func TestFreshLocalSchemaUsesWorkspaceWithoutIdentityTables(t *testing.T) {
 	if !db.Migrator().HasTable("workspaces") {
 		t.Fatal("fresh local schema has no workspace root")
 	}
-	for _, table := range []string{"users", "auth_sessions", "user_identities", "oauth_states", "email_verification_codes"} {
+	for _, table := range []string{"users", "user_identities", "oauth_states", "email_verification_codes"} {
 		if db.Migrator().HasTable(table) {
 			t.Fatalf("fresh local schema retained identity table %q", table)
 		}
+	}
+	// v14 起 auth_sessions 是本地账号会话表，不再是托管版遗留表。
+	if !db.Migrator().HasTable("accounts") || !db.Migrator().HasTable("auth_sessions") {
+		t.Fatal("fresh local schema is missing the v14 account tables")
 	}
 	var count int64
 	if err := db.Table("workspaces").Count(&count).Error; err != nil || count != 1 {
@@ -346,10 +350,22 @@ func TestLocalSchemaUpgradeDropsHostedTablesAndKeepsCoreData(t *testing.T) {
 	if err := MigrateLocalSchema(db); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"auth_sessions", "canvas_shares", "user_oss_settings", "billing_orders", "payment_orders", "redeem_codes"} {
+	for _, table := range []string{"canvas_shares", "user_oss_settings", "billing_orders", "payment_orders", "redeem_codes"} {
 		if db.Migrator().HasTable(table) {
 			t.Fatalf("hosted table %q survived local migration", table)
 		}
+	}
+	// auth_sessions 自 v14 起属于本地账号体系：旧托管表被清掉后由 v14 重建，
+	// 所以它必须存在并且是带 token_hash 的新结构，而不是旧表残留。
+	if !db.Migrator().HasTable("auth_sessions") {
+		t.Fatal("v14 did not recreate the local session table")
+	}
+	hasTokenHash, err := sqliteHasColumn(db, "auth_sessions", "token_hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTokenHash {
+		t.Fatal("legacy hosted auth_sessions survived the v14 migration")
 	}
 	var count int64
 	if err := db.Model(&model.Project{}).Where("id = ?", "project-keep").Count(&count).Error; err != nil || count != 1 {
@@ -421,7 +437,7 @@ func TestAssistantTurnsMigrationFromPreviewV9(t *testing.T) {
 	if err := db.Order("version").Find(&ledger).Error; err != nil {
 		t.Fatal(err)
 	}
-	if ledger[len(ledger)-1].Version != CurrentSchemaVersion || ledger[len(ledger)-1].Name != "upload-reservation-witness" {
+	if ledger[len(ledger)-1].Version != CurrentSchemaVersion || ledger[len(ledger)-1].Name != "public-auth-accounts" {
 		t.Fatalf("current identity: %+v", ledger[len(ledger)-1])
 	}
 	foundV10 := false
@@ -438,6 +454,9 @@ func TestAssistantTurnsMigrationFromPreviewV9(t *testing.T) {
 	}
 	if !db.Migrator().HasTable(&model.CanvasLibraryFolder{}) || !db.Migrator().HasTable(&model.CanvasDrawing{}) {
 		t.Fatal("v12 did not create canvas library tables")
+	}
+	if !db.Migrator().HasTable(&model.Account{}) || !db.Migrator().HasTable(&model.AuthSession{}) {
+		t.Fatal("v14 did not create the local account tables")
 	}
 	for i, row := range before {
 		if ledger[i].Name != row.Name || !ledger[i].AppliedAt.Equal(row.AppliedAt) {

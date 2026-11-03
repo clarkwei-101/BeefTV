@@ -480,12 +480,10 @@ func TestResolveLocalModelSelection(t *testing.T) {
 			wantModel:      "qwen3:8b",
 		},
 		{
-			name:           "dgx deepseek text",
+			name:           "removed deepseek channel is not local",
 			logicalModelID: "dgx-deepseek-local::deepseek-v4-flash",
 			taskType:       "canvas_text",
-			want:           true,
-			wantBaseURL:    DefaultLocalProxyBaseURL,
-			wantModel:      "deepseek-v4-flash",
+			want:           false,
 		},
 		{
 			name:           "no separator is not local",

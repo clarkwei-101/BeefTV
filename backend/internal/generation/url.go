@@ -1,6 +1,7 @@
 package generation
 
 import (
+	"net"
 	"net/url"
 	"strings"
 
@@ -107,6 +108,26 @@ func IsBeefAPIHost(host string) bool {
 func isBeefAPIHost(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	return host == "beefapi.com" || strings.HasSuffix(host, ".beefapi.com")
+}
+
+// IsLoopbackUpstream 判断渠道是否指向本机桥接（127.0.0.0/8、::1、localhost）。
+//
+// 本机桥接与后端同机部署，能直接解码内嵌 data URL，因此“必须公网素材地址”的
+// 约束对它不成立；公网渠道仍按原规则要求可访问的素材链接。
+func IsLoopbackUpstream(baseURL string) bool {
+	base, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || base.Host == "" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(base.Hostname()))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func SameProviderOrigin(baseURL string, rawURL string) bool {

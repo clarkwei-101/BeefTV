@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { App, Button, Dropdown, Input, Popover, Tag, Typography } from "antd";
 import { Callout } from "@/components/ui/product/callout";
-import { Bubble, Sender, type BubbleItemType } from "@ant-design/x";
+// Deep imports on purpose: the `@ant-design/x` barrel re-exports `Mermaid`,
+// which statically imports the `mermaid` npm package (~83 MB). Nothing here
+// renders diagrams, so the barrel drags an unused rendering engine into the
+// production bundle and into every test that touches this module.
+// `es/bubble` and `es/sender` expose the same API (including `Bubble.List` and
+// `Sender.Header`) and never reach `mermaid`: its only reference inside
+// `x-provider` is a type-only import.
+import Bubble, { type BubbleItemType } from "@ant-design/x/es/bubble";
+import Sender from "@ant-design/x/es/sender";
 import { ArrowUp, Check, ChevronDown, FileText, Image as ImageIcon, LoaderCircle, Music2, Sparkles, UserRound, Video, X } from "lucide-react";
 
 import { ModelPicker } from "@/components/model-picker";

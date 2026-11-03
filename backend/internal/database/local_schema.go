@@ -15,7 +15,7 @@ import (
 	"gorm.io/gorm"
 )
 
-const CurrentSchemaVersion int64 = 13
+const CurrentSchemaVersion int64 = 14
 
 type localSchemaMigration struct {
 	Version   int64 `gorm:"primaryKey;autoIncrement:false"`
@@ -87,6 +87,7 @@ func canonicalLocalMigrations() []localMigration {
 		{version: 11, name: "creation-conversations", apply: migrateCreationConversations},
 		{version: 12, name: "canvas-library-drawings", apply: migrateCanvasLibrarySchema},
 		{version: 13, name: "upload-reservation-witness", apply: migrateUploadReservationWitness},
+		{version: 14, name: "public-auth-accounts", apply: migratePublicAuthAccounts},
 	}
 }
 
@@ -177,6 +178,28 @@ func migrateProductAgentSchema(tx *gorm.DB) error {
 		return err
 	}
 	return ensureTaskUserClientOpIndex(tx)
+}
+
+func migratePublicAuthAccounts(tx *gorm.DB) error {
+	// 旧版托管 schema 的 auth_sessions 没有 token_hash（它按 user_id 存会话）。
+	// v2 迁移会删除这张表，但 v2 的版本号在历史预览分支上可能被占用而没有真正
+	// 执行过，于是这张旧表会活到 v14。此时 AutoMigrate 只会往旧表上补列，
+	// 旧行的 token_hash 全为空，登录时唯一索引会直接冲突。清理掉它再重建。
+	if tx.Migrator().HasTable("auth_sessions") {
+		hasTokenHash, err := sqliteHasColumn(tx, "auth_sessions", "token_hash")
+		if err != nil {
+			return err
+		}
+		if !hasTokenHash {
+			if err := tx.Migrator().DropTable("auth_sessions"); err != nil {
+				return fmt.Errorf("清理旧版会话表: %w", err)
+			}
+		}
+	}
+	if err := tx.AutoMigrate(&model.Account{}, &model.AuthSession{}); err != nil {
+		return fmt.Errorf("迁移公网账号结构: %w", err)
+	}
+	return nil
 }
 
 func migrateUploadReservationWitness(tx *gorm.DB) error {
@@ -464,7 +487,19 @@ func requireReconciledSchema(db *gorm.DB) error {
 		}
 	}
 	if version >= 12 {
-		return requireCanvasLibrarySchema(db)
+		if err := requireCanvasLibrarySchema(db); err != nil {
+			return err
+		}
+	}
+	if version >= 13 {
+		if !db.Migrator().HasTable(&model.UserUploadReservation{}) {
+			return fmt.Errorf("本地上传预留表缺失，请启用自动迁移")
+		}
+	}
+	if version >= 14 {
+		if err := requirePublicAuthSchema(db); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -26,7 +26,11 @@ func RegisterAgentOpsRoutes(r gin.IRouter, svc *app.Service, store *agentops.Sto
 	agentops.RegisterDefaultOps(registry)
 
 	r.GET("/ops", func(c *gin.Context) {
-		if !isLoopbackRequest(c.Request) {
+		// server profile 下已登录会话不受 loopback 限制：ServerAuthMiddleware
+		// 已验证 Bearer 会话（非 cookie，不存在跨站伪造风险），而隧道/反代后的
+		// Origin 与后端 Host 必然不一致。desktop profile 没有会话中间件，
+		// SessionAccount 恒为空，行为不变。
+		if _, authed := SessionAccount(c); !authed && !isLoopbackRequest(c.Request) {
 			fail(c, http.StatusForbidden, app.BadAuthRequest("操作层只接受本机请求"))
 			return
 		}
@@ -51,6 +55,7 @@ func RegisterAgentOpsRoutes(r gin.IRouter, svc *app.Service, store *agentops.Sto
 	})
 
 	r.POST("/ops/clients", func(c *gin.Context) {
+		// 客户端登记=提权入口：签名发永远要求 loopback（桌面凭据签发面保持现状）。
 		if !isLoopbackRequest(c.Request) {
 			fail(c, http.StatusForbidden, app.BadAuthRequest("客户端登记只接受本机请求"))
 			return
@@ -93,8 +98,11 @@ func RegisterAgentOpsRoutes(r gin.IRouter, svc *app.Service, store *agentops.Sto
 	})
 
 	r.POST("/ops/:op", func(c *gin.Context) {
-		// 本机入口：只接受 loopback 来源，避免被浏览器跨站或外部主机调用。
-		if !isLoopbackRequest(c.Request) {
+		// 本机入口 + server profile 已登录会话：Bearer 会话经 ServerAuthMiddleware
+		// 验证（非 cookie，无跨站伪造风险），隧道/反代后的 Origin 与后端 Host
+		// 必然不一致，不能再要求 loopback。desktop profile 没有会话中间件，
+		// SessionAccount 恒为空，行为不变。
+		if _, authed := SessionAccount(c); !authed && !isLoopbackRequest(c.Request) {
 			fail(c, http.StatusForbidden, app.BadAuthRequest("操作层只接受本机请求"))
 			return
 		}
@@ -159,6 +167,7 @@ func RegisterAgentOpsRoutes(r gin.IRouter, svc *app.Service, store *agentops.Sto
 // resolveCaller 决定本次调用的身份与能力模式。
 // 已登记的客户端：模式完全由服务端登记决定，请求体/请求头都不能自行提升或改变。
 // 内置助手宿主：凭自己那份后端注入的宿主凭据拿到读写；页面的 UI 会话凭据不在这里。
+// server profile 已登录会话：Bearer 会话即手工 UI 身份（manual），与 owner/本机直连同权。
 // owner 通道是手工 UI 与本机直连的身份。
 func resolveCaller(c *gin.Context, svc *app.Service, clients *agentops.ClientRegistry) (agentops.Caller, string, error) {
 	if isAssistantHostRequest(c, svc) {
@@ -178,6 +187,11 @@ func resolveCaller(c *gin.Context, svc *app.Service, clients *agentops.ClientReg
 	}
 	if trustedDesktopUI(c) {
 		return agentops.Caller{Kind: agentops.CallerManual}, "desktop-ui", nil
+	}
+	// server profile：已登录会话即手工 UI 身份。desktop profile 下
+	// SessionAccount 恒为空，不会误授。
+	if _, authed := SessionAccount(c); authed {
+		return agentops.Caller{Kind: agentops.CallerManual}, "session", nil
 	}
 	return agentops.Caller{}, "", errUnidentified
 }

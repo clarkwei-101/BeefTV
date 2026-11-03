@@ -1,0 +1,50 @@
+# ─── Cloudflare Zero Trust Access Policy ─────────────────────────────────────
+#
+# How it works:
+#   1. Any unauthenticated request → Cloudflare blocks it at the edge.
+#   2. The user opens https://beeftv.<YOUR_DOMAIN>
+#   3. Cloudflare presents a login page (email + one-time passcode).
+#   4. After confirming their email, traffic is routed through to the web server.
+#
+# Setup steps:
+#   1. In the Zero Trust dashboard (dash.cloudflare.com → Zero Trust):
+#        • Create a tunnel named "beeftv-local" and note the TUNNEL ID.
+#        • Add a DNS CNAME: beeftv.<YOUR_DOMAIN> → <tunnel-id>.cfargotunnel.com
+#        • In Access → Applications → Add an application → Self-hosted
+#          → configure as shown below.
+#   2. In Access → Access policies: the "Allow" rule must list the user's email.
+#      The "Block" default rule cannot be removed; everything not explicitly
+#      allowed is blocked.
+#   3. Set the "Application domain" to beeftf.<YOUR_DOMAIN>.
+#
+# NOTE: Cloudflare Free plan supports Zero Trust Access with email OTP
+#       for up to 3 applications. No credit card required.
+
+{
+  "name": "beeftv-local",
+  "status": "active",
+  "type": "localhost",
+  "session_duration": "24h",
+  "policies": [
+    {
+      "name": "Owner access",
+      "decision": "allow",
+      "include": [
+        {
+          "email": {
+            "email": "OWNER@YOUR_DOMAIN.com"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Deny all others",
+      "decision": "block",
+      "include": [
+        {
+          "emails": null
+        }
+      ]
+    }
+  ]
+}

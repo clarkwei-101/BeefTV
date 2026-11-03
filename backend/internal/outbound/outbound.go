@@ -58,8 +58,13 @@ func ValidateOutboundURL(rawURL string) (*url.URL, error) {
 	if parsed.User != nil {
 		return nil, BadAuthRequest("外部服务地址不允许包含认证信息")
 	}
-	if err := ValidateOutboundHost(parsed.Hostname()); err != nil {
-		return nil, err
+	// The server's own local generation proxy runs on loopback. It is
+	// operator-configured and not reachable from user input, so it is exempt
+	// from the private-address guard — but only for its exact host:port.
+	if !LocalProxyUpstreamAuthority(parsed.Hostname(), parsed.Port()) {
+		if err := ValidateOutboundHost(parsed.Hostname()); err != nil {
+			return nil, err
+		}
 	}
 	return parsed, nil
 }
@@ -247,7 +252,7 @@ func blockedOutboundHeader(name string) bool {
 	return strings.HasPrefix(name, "x-canvas-") || strings.HasPrefix(name, "x-forwarded-")
 }
 
-func newOutboundTransport(resolveHost func(context.Context, string) ([]net.IP, error)) *http.Transport {
+func newOutboundTransport(resolveHost func(context.Context, string, string) ([]net.IP, error)) *http.Transport {
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
 	return &http.Transport{
 		Proxy: outboundProxyFromEnvironment,
@@ -260,7 +265,7 @@ func newOutboundTransport(resolveHost func(context.Context, string) ([]net.IP, e
 			if configuredProxyHost(host) {
 				return dialer.DialContext(ctx, network, address)
 			}
-			addresses, err := resolveHost(ctx, host)
+			addresses, err := resolveHost(ctx, host, port)
 			if err != nil {
 				return nil, err
 			}
@@ -301,21 +306,27 @@ func configuredProxyHost(host string) bool {
 }
 
 func ValidateOutboundHost(host string) error {
-	_, err := resolveOutboundHost(context.Background(), host)
+	_, err := resolveOutboundHost(context.Background(), host, "")
 	return err
 }
 
 func validateCustomRelayHost(host string) error {
-	_, err := resolveCustomRelayHost(context.Background(), host)
+	_, err := resolveCustomRelayHost(context.Background(), host, "")
 	return err
 }
 
-func resolveOutboundHost(ctx context.Context, host string) ([]net.IP, error) {
+// resolveOutboundHost resolves an outbound target and enforces the SSRF guard.
+//
+// The port is used only to detect the server's own local generation proxy,
+// which is exempt from the private-address guard for its exact host:port pair.
+// An empty port means "no port known" and never matches the proxy.
+func resolveOutboundHost(ctx context.Context, host string, port string) ([]net.IP, error) {
 	host = normalizeOutboundHost(host)
-	return resolveOutboundHostWithPolicy(ctx, host, allowPrivateUpstreams() || AllowedPrivateUpstreamHost(host))
+	allowPrivate := allowPrivateUpstreams() || AllowedPrivateUpstreamHost(host) || LocalProxyUpstreamAuthority(host, port)
+	return resolveOutboundHostWithPolicy(ctx, host, allowPrivate)
 }
 
-func resolveCustomRelayHost(ctx context.Context, host string) ([]net.IP, error) {
+func resolveCustomRelayHost(ctx context.Context, host string, port string) ([]net.IP, error) {
 	host = normalizeOutboundHost(host)
 	allowPrivateHost := AllowedPrivateUpstreamHost(host)
 	addresses, err := resolveOutboundHostWithPolicy(ctx, host, allowPrivateHost)
@@ -395,6 +406,85 @@ func AllowedPrivateUpstreamHost(host string) bool {
 		}
 	}
 	return false
+}
+
+// LocalProxyBaseURLEnv is the server-side configured address of the local
+// generation proxy (beeftv_proxy.py). The value is operator-controlled, not
+// user-controlled, so it is safe to trust for SSRF purposes.
+const LocalProxyBaseURLEnv = "CANVAS_LOCAL_PROXY_BASE_URL"
+
+// defaultLocalProxyBaseURL matches the local proxy's documented default bind
+// address. It is an IPv4 literal because beeftv_proxy.py binds 0.0.0.0 while
+// Go's resolver prefers ::1 for "localhost".
+const defaultLocalProxyBaseURL = "http://127.0.0.1:8198"
+
+// localProxyAuthority returns the host:port of the server's own local
+// generation proxy, or "" when it cannot be determined.
+func localProxyAuthority() string {
+	configured := strings.TrimSpace(os.Getenv(LocalProxyBaseURLEnv))
+	if configured == "" {
+		configured = defaultLocalProxyBaseURL
+	}
+	parsed, err := url.Parse(configured)
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	port := parsed.Port()
+	if port == "" {
+		if parsed.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(normalizeOutboundHost(parsed.Hostname()), port)
+}
+
+// LocalProxyUpstreamAuthority reports whether host:port is exactly the
+// server's own local generation proxy.
+//
+// The local proxy runs on loopback, so the generic SSRF guard rejects it as a
+// private address. That guard exists to stop user-supplied upstreams from
+// reaching the machine's internal network; the local proxy is neither
+// user-supplied nor attacker-controlled, so it has to be reachable.
+//
+// The exemption is scoped to the exact host:port pair, not to the host alone,
+// so every other loopback port stays blocked. It is also not folded into
+// AllowedPrivateUpstreamHost, whose host-level semantics are covered by
+// operator configuration and by dedicated security tests.
+func LocalProxyUpstreamAuthority(host, port string) bool {
+	authority := localProxyAuthority()
+	if authority == "" {
+		return false
+	}
+	host = normalizeOutboundHost(host)
+	if host == "" {
+		return false
+	}
+	port = strings.TrimSpace(port)
+	if port == "" {
+		return false
+	}
+	return net.JoinHostPort(host, port) == authority
+}
+
+// LocalProxyUpstreamHost reports whether host is the local proxy's host.
+// It is used only for the HTTP scheme check on the proxy's own URL; port
+// matching still happens in LocalProxyUpstreamAuthority.
+func LocalProxyUpstreamHost(host string) bool {
+	authority := localProxyAuthority()
+	if authority == "" {
+		return false
+	}
+	return normalizeOutboundHost(host) == authorityHost(authority)
+}
+
+// authorityHost extracts the host portion of a host:port authority string.
+func authorityHost(authority string) string {
+	if host, _, err := net.SplitHostPort(authority); err == nil {
+		return host
+	}
+	return authority
 }
 
 func normalizeOutboundHost(host string) string {

@@ -36,6 +36,12 @@ func MediaHydrationPolicyFor(ctx context.Context, input Input) MediaHydrationPol
 		policy.RequireURL = false
 		policy.PreferURL = false
 	}
+	// 本机桥接（loopback 上游）能直接消费内嵌素材：它与后端同机，data URL
+	// 到桥接进程内再解码即可，不需要公网可达的素材地址。公网渠道保持原规则。
+	if policy.RequireURL && IsLoopbackUpstream(input.Config.BaseURL) {
+		policy.RequireURL = false
+		policy.PreferURL = false
+	}
 	return policy
 }
 

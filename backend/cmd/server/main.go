@@ -42,14 +42,15 @@ func run(ctx context.Context) error {
 		return err
 	}
 	runtime, err := bootstrap.Open(ctx, bootstrap.Config{
-		Profile:          bootstrap.ProfileServer,
-		DataDir:          dataDir,
-		DatabaseDriver:   env("CANVAS_DATABASE_DRIVER", "sqlite"),
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
-		ListenAddr:       env("CANVAS_BACKEND_ADDR", ":8080"),
-		AutoMigrate:      autoMigrate,
-		ShutdownTimeout:  workerTimeout,
-		RouterMiddleware: []gin.HandlerFunc{corsMiddleware},
+		Profile:           bootstrap.ProfileServer,
+		DataDir:           dataDir,
+		DatabaseDriver:    env("CANVAS_DATABASE_DRIVER", "sqlite"),
+		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		ListenAddr:        env("CANVAS_BACKEND_ADDR", ":8080"),
+		AllowRegistration: bootstrap.RegistrationEnabled(),
+		AutoMigrate:       autoMigrate,
+		ShutdownTimeout:   workerTimeout,
+		RouterMiddleware:  []gin.HandlerFunc{corsMiddleware},
 	})
 	if err != nil {
 		return err

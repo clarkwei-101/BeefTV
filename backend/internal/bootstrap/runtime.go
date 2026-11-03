@@ -188,6 +188,9 @@ func Open(_ context.Context, raw Config) (*Runtime, error) {
 	}
 	if cfg.Profile == ProfileDesktop {
 		router.Use(desktopCORSMiddleware())
+	} else {
+		// server profile（公网部署）：写操作必须携带登录会话。
+		router.Use(canvasHandler.ServerAuthMiddleware(svc))
 	}
 	router.Use(canvasHandler.WorkspaceMiddleware(scope))
 	// 本机可信凭据在组合根生成：owner 凭据与宿主凭据只在本机数据目录，0600。
@@ -196,6 +199,12 @@ func Open(_ context.Context, raw Config) (*Runtime, error) {
 	api := router.Group("/api")
 	status := newSystemStatus(db, svc, true)
 	registerSystemStatusRoutes(api, status)
+	// 注册开关：desktop 恒开放（本机无 auth 中间件）；server 由 cmd/server 从环境传入。
+	allowRegistration := cfg.AllowRegistration
+	if cfg.Profile == ProfileDesktop {
+		allowRegistration = true
+	}
+	canvasHandler.RegisterAuthRoutes(api, svc, string(cfg.Profile), allowRegistration)
 	canvasHandler.RegisterDesktopCanvasAPIWithDependencies(api, svc, canvasHandler.RuntimeDependencies{
 		RequestCoordinator: localKernel,
 		ProviderConfig:     localRoot.ProviderConfig,

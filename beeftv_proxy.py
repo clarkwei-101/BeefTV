@@ -27,6 +27,7 @@ import base64
 import functools
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -45,6 +46,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, Response, Uploa
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("beeftv-proxy")
@@ -101,6 +103,27 @@ PIPER_VOICE_DIR = Path(
 )
 DEFAULT_VOICE = os.environ.get("BEEFTV_DEFAULT_VOICE", "zh_CN-huayan-medium")
 FFMPEG_BIN = os.environ.get("BEEFTV_FFMPEG", "ffmpeg")
+# 常驻代理由 launchd 拉起时 PATH 只有系统目录，Homebrew 的 ffmpeg 不在其中，
+# shutil.which("ffmpeg") 会返回 None，语音合成就会报 "ffmpeg is not installed"。
+FFMPEG_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/usr/bin/ffmpeg",
+)
+
+
+def resolve_ffmpeg() -> "str | None":
+    """找到可执行的 ffmpeg，PATH 之后按 Homebrew 常见安装位置兜底。"""
+    found = shutil.which(FFMPEG_BIN)
+    if found:
+        return found
+    if os.path.isabs(FFMPEG_BIN):
+        return FFMPEG_BIN if os.access(FFMPEG_BIN, os.X_OK) else None
+    for candidate in FFMPEG_FALLBACK_PATHS:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
 
 # Piper's pinyin voices pull g2pW, which in turn pulls a BERT tokenizer from
 # Hugging Face. The Reachy venv ships a transformers new enough to call an HF
@@ -186,7 +209,29 @@ async def log_request_validation_error(request: Request, exc: RequestValidationE
         request.url.path,
         ",".join(rejected),
     )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return JSONResponse(status_code=422, content={"detail": _jsonable_errors(exc.errors())})
+
+
+def _jsonable_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Make a validation error list safe to serialise.
+
+    FastAPI puts the raw rejected input into ``ctx.input`` — for a multipart
+    upload that is the file *bytes*. ``json.dumps`` then raised
+    ``TypeError: Object of type bytes is not JSON serializable`` inside the
+    exception handler, so the client got an opaque 500 instead of the 422 it
+    needed. Binary inputs are replaced by a short description.
+    """
+    safe: List[Dict[str, Any]] = []
+    for item in errors:
+        entry = {key: value for key, value in item.items() if key != "ctx"}
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            entry["ctx"] = {
+                key: (f"<{len(value)} bytes>" if isinstance(value, (bytes, bytearray)) else value)
+                for key, value in ctx.items()
+            }
+        safe.append(entry)
+    return safe
 
 # ── Auth + CORS Middleware ─────────────────────────────────────────────────────
 
@@ -317,6 +362,50 @@ def message_text(message: Message) -> str:
     return "\n".join(parts)
 
 
+def contains_cjk(text: str) -> bool:
+    """True when the prompt has CJK characters.
+
+    FLUX/SDXL/H3 text encoders (CLIP/T5) are English-only: a Chinese prompt
+    is near-gibberish to them and renders "nothing like what I asked for".
+    """
+    return bool(re.search(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]", text or ""))
+
+
+async def translate_prompt_to_english(prompt: str) -> str:
+    """Translate a CJK prompt to English via local Ollama.
+
+    Best-effort: any failure (Ollama down, timeout, empty result) returns the
+    original prompt so generation still proceeds. Pure-English prompts skip
+    the round-trip entirely.
+    """
+    if not prompt or not contains_cjk(prompt):
+        return prompt
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Translate the following image/video generation prompt to English. Output ONLY the English translation, no explanations:\n" + prompt,
+                        }
+                    ],
+                    "stream": False,
+                    "think": False,
+                },
+            )
+        resp.raise_for_status()
+        content = extract_text_from_ollama_response(resp.json()).strip()
+        if content:
+            log.info(f"[prompt-i18n] {prompt[:60]!r} -> {content[:80]!r}")
+            return content
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[prompt-i18n] translation failed, using original: {exc}")
+    return prompt
+
+
 class ChatCompletionRequest(BaseModel):
     # Reject unknown fields rather than silently ignoring them — a typo like
     # ``temprature: 0.2`` would otherwise be swallowed and the request would
@@ -357,6 +446,10 @@ class ChatCompletionRequest(BaseModel):
     turbo: str = "4step"
     shift_video: float = Field(default=12.0, ge=0.0, le=20.0)
     shift_audio: float = Field(default=3.0, ge=0.0, le=20.0)
+    # Reference images for the video models (image-to-video, first/last frame,
+    # reference-to-video). The NewAPI contract carries them as ``image_urls``;
+    # the chat contract needs its own field because the model forbids extras.
+    image_urls: List[str] = Field(default_factory=list)
 
 
 class ImageEditPart(BaseModel):
@@ -467,6 +560,7 @@ def build_minimax_h3_workflow(
     shift_audio: float = 3.0,
     turbo_mode: str = "4step",
     filename_prefix: str = "video/BeefTV",
+    images: Optional[List[str]] = None,
 ) -> dict:
     """Build the MiniMax H3 T2V workflow JSON for ComfyUI.
 
@@ -474,7 +568,22 @@ def build_minimax_h3_workflow(
     a node-schema fact, not a workflow choice — so any caller-supplied
     negative prompt is logged and dropped here rather than injected into a
     graph the DGX would reject.
+
+    ``images`` holds ComfyUI *input* filenames (already staged on the DGX) and
+    selects the H3 conditioning mode:
+
+    * 0 images → t2va (text to video + audio)
+    * 1 image  → fl2va with a first frame (image to video)
+    * 2 images → fl2va with first and last frame (first/last frame to video)
+    * 3+ images → ref2va (``MiniMaxH3ReferenceToVideo`` with ``ref_image_N``),
+      which is the only mode that takes several references; the prompt then
+      needs ``<Picture i>`` tags, which the caller adds.
     """
+    staged_images = [name for name in (images or []) if name]
+    if len(staged_images) > 2 and turbo_mode != "off":
+        # Three or more references need the ref2va checkpoint; the fl2v turbo
+        # LoRA only knows about a first/last keyframe pair.
+        turbo_mode = "ref2v"
     use_turbo = turbo_mode != "off"
     if turbo_mode == "4step":
         turbo_lora = "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors"
@@ -612,17 +721,59 @@ def build_minimax_h3_workflow(
         }
         model_for_guider = ["21", 0]
 
-    nodes["7"] = {
-        "class_type": "MiniMaxH3ImageToVideo",
-        "inputs": {
+    if len(staged_images) > 2:
+        # ref2va: every reference is a separate LoadImage fed through the
+        # autogrow group (``ref_image_0``, ``ref_image_1``, …).
+        ref_inputs: Dict[str, Any] = {
+            "clip": ["2", 0],
+            "vae": ["3", 0],
+            "audio_vae": ["4", 0],
+            "prompt": prompt,
+            "width": width,
+            "height": height,
+            "length": length_frames,
+            "ref_image_size": "match",
+        }
+        for index, image_name in enumerate(staged_images[:9]):
+            load_id = str(100 + index)
+            nodes[load_id] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": image_name},
+            }
+            # ComfyUI expands an autogrow group from ``<group>.<index>`` keys:
+            # ``ref_images.ref_image_0`` becomes ``ref_images={"ref_image_0": …}``
+            # for the node. A bare ``ref_image_0`` is passed straight through and
+            # the node then rejects it with "unexpected keyword argument".
+            ref_inputs[f"ref_images.ref_image_{index}"] = [load_id, 0]
+        nodes["7"] = {
+            "class_type": "MiniMaxH3ReferenceToVideo",
+            "inputs": ref_inputs,
+        }
+    else:
+        frame_inputs: Dict[str, Any] = {
             "clip": ["2", 0],
             "vae": ["3", 0],
             "prompt": prompt,
             "width": width,
             "height": height,
             "length": length_frames,
-        },
-    }
+        }
+        if staged_images:
+            nodes["30"] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": staged_images[0]},
+            }
+            frame_inputs["first_frame"] = ["30", 0]
+        if len(staged_images) == 2:
+            nodes["31"] = {
+                "class_type": "LoadImage",
+                "inputs": {"image": staged_images[1]},
+            }
+            frame_inputs["last_frame"] = ["31", 0]
+        nodes["7"] = {
+            "class_type": "MiniMaxH3ImageToVideo",
+            "inputs": frame_inputs,
+        }
     nodes["8"] = {"class_type": "PrimitiveInt", "inputs": {"value": seed}}
     nodes["9"] = {
         "class_type": "RandomNoise",
@@ -1273,7 +1424,15 @@ async def stage_reference_image(source: str, client: httpx.AsyncClient) -> str:
         ext = "png"
         if "image/" in header and "/" in header.split("image/", 1)[1]:
             ext = header.split("image/", 1)[1].split(";")[0] or "png"
-        blob = base64.b64decode(payload)
+        try:
+            blob = base64.b64decode(payload, validate=False)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"Malformed data URI: {exc}")
+        if not blob:
+            raise HTTPException(status_code=400, detail="data URI carried no bytes")
+        # The name derived from the URI is garbage for a data URI, and the
+        # extension has to survive: ComfyUI picks its image loader from it.
+        name = f"ref-{uuid.uuid4().hex[:8]}.{ext}"
     elif source.startswith(("http://", "https://")):
         resp = await client.get(source, timeout=120)
         resp.raise_for_status()
@@ -1320,6 +1479,26 @@ async def stage_reference_image(source: str, client: httpx.AsyncClient) -> str:
         )
     uploaded = resp.json()
     return uploaded.get("name", name)
+
+
+async def stage_reference_images(sources: List[str], client: httpx.AsyncClient) -> List[str]:
+    """Stage every reference image and return the ComfyUI input filenames.
+
+    A reference that cannot be staged is dropped instead of failing the whole
+    job: the remaining references still condition the render, and the log
+    records which one was lost.
+    """
+    staged: List[str] = []
+    for source in sources:
+        if not source:
+            continue
+        try:
+            staged.append(await stage_reference_image(source, client))
+        except HTTPException as exc:
+            log.warning(f"Could not stage reference image: {exc.detail}")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Could not stage reference image: {exc}")
+    return staged
 
 
 
@@ -1497,10 +1676,14 @@ async def piper_synthesize(req: SpeechRequest) -> tuple[bytes, str]:
 
 async def ffmpeg_convert(src: Path, fmt: str, volume: float, workdir: Path) -> bytes:
     """Re-encode Piper's wav output, applying a volume gain on the way."""
-    if shutil.which(FFMPEG_BIN) is None:
-        raise RuntimeError(f"{FFMPEG_BIN} is not installed; cannot produce {fmt}")
+    ffmpeg = resolve_ffmpeg()
+    if ffmpeg is None:
+        raise RuntimeError(
+            f"{FFMPEG_BIN} is not installed; cannot produce {fmt} "
+            "(set BEEFTV_FFMPEG to an absolute path)"
+        )
     dest = workdir / f"out.{fmt}"
-    cmd = [FFMPEG_BIN, "-y", "-i", str(src), "-af", f"volume={max(0.0, volume):.2f}", str(dest)]
+    cmd = [ffmpeg, "-y", "-i", str(src), "-af", f"volume={max(0.0, volume):.2f}", str(dest)]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
     )
@@ -1950,6 +2133,7 @@ async def image_generations(req: ImageRequest):
     """Text-to-image. Defaults to FLUX.1 Schnell, falls back to SDXL."""
     if not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required")
+    req.prompt = await translate_prompt_to_english(req.prompt)
     try:
         width, height = parse_size(req.size)
     except ValueError as exc:
@@ -1975,17 +2159,54 @@ async def image_generations(req: ImageRequest):
 
 
 @app.post("/v1/images/edits")
-async def image_edits(req: ImageEditRequest):
-    """Image-to-image. A source image is mandatory here."""
+async def image_edits(request: Request):
+    """Image-to-image. Accepts the OpenAI multipart contract and a JSON body.
+
+    The BeefTV backend posts ``multipart/form-data`` here — one ``image`` part
+    per reference image plus an optional ``mask`` — because that is the OpenAI
+    Images Edits contract. A JSON-only handler turned every such request into
+    a 422, and before the validation handler was hardened into a 500 with a
+    traceback, so the reference image never reached ComfyUI at all.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in content_type:
+        return await _image_edits_multipart(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="request body must be JSON or multipart/form-data",
+        )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="image edit request must be a JSON object")
+    try:
+        req = ImageEditRequest(**payload)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"invalid image edit request: {exc}")
     source = req.image or (req.image_urls[0] if req.image_urls else None)
     if not source:
         raise HTTPException(status_code=400, detail="image is required for edits")
+    return await _run_image_edit(req, source=source)
+
+
+async def _run_image_edit(
+    req: ImageEditRequest,
+    source: Optional[str] = None,
+    staged: Optional[str] = None,
+) -> JSONResponse:
+    """Run an image edit against FLUX/SDXL through ComfyUI."""
+    req.prompt = await translate_prompt_to_english(req.prompt)
     try:
         width, height = parse_size(req.size)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     async with httpx.AsyncClient(timeout=300) as client:
-        init_image = await stage_reference_image(source, client)
+        init_image = staged
+        if init_image is None:
+            if not source:
+                raise HTTPException(status_code=400, detail="image is required for edits")
+            init_image = await stage_reference_image(source, client)
         workflow, prefix = await build_image_workflow_async(
             prompt=req.prompt,
             model=req.model,
@@ -2000,6 +2221,101 @@ async def image_edits(req: ImageEditRequest):
         )
         images = await run_image_workflow(workflow, prefix)
     return JSONResponse(await shape_images(images, req.response_format, PUBLIC_BASE))
+
+
+async def _image_edits_multipart(request: Request) -> JSONResponse:
+    """Handle the OpenAI Images Edits multipart upload."""
+    form = await request.form()
+    # Starlette's form parser returns ``starlette.datastructures.UploadFile``.
+    # FastAPI's ``UploadFile`` is a *subclass* of it, so checking against the
+    # FastAPI class here would never match and every uploaded reference image
+    # would be reported as "image is required for edits".
+    uploads = [
+        item
+        for item in form.getlist("image")
+        if isinstance(item, StarletteUploadFile)
+    ]
+    if not uploads:
+        raise HTTPException(status_code=400, detail="image is required for edits")
+    if len(uploads) > 1:
+        log.warning(
+            f"Image edit received {len(uploads)} reference images; "
+            "FLUX/SDXL img2img conditions on the first one only"
+        )
+    mask = form.get("mask")
+    if isinstance(mask, StarletteUploadFile):
+        await mask.close()
+        raise HTTPException(
+            status_code=400,
+            detail="本地桥接暂不支持蒙版编辑，请改用整图重绘或选择支持蒙版的渠道",
+        )
+    upload = uploads[0]
+    blob = await upload.read()
+    await upload.close()
+    if not blob:
+        raise HTTPException(status_code=400, detail="image is empty")
+    if len(blob) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="image larger than 20 MB")
+    ext = (upload.filename or "").rsplit(".", 1)[-1].lower() if upload.filename and "." in upload.filename else "png"
+    if ext not in {"png", "jpg", "jpeg", "webp", "bmp"}:
+        ext = "png"
+    staged_name = f"ref-{uuid.uuid4().hex[:12]}.{ext}"
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        staged = await stage_upload_to_comfy(staged_name, blob, upload.content_type, client)
+
+    req = ImageEditRequest(
+        model=str(form.get("model") or DEFAULT_IMAGE_MODEL),
+        prompt=str(form.get("prompt") or ""),
+        n=_form_int(form.get("n"), 1),
+        size=str(form.get("size") or "1024x1024"),
+        response_format=str(form.get("response_format") or "url"),
+        seed=_form_int(form.get("seed"), None),
+        steps=_form_int(form.get("steps"), None),
+        guidance=_form_float(form.get("guidance"), None),
+        strength=_form_float(form.get("strength"), None),
+    )
+    return await _run_image_edit(req, staged=staged)
+
+
+def _form_int(value: Any, fallback: Optional[int]) -> Optional[int]:
+    if value is None or value == "":
+        return fallback
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _form_float(value: Any, fallback: Optional[float]) -> Optional[float]:
+    if value is None or value == "":
+        return fallback
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+async def stage_upload_to_comfy(
+    name: str,
+    blob: bytes,
+    content_type: Optional[str],
+    client: httpx.AsyncClient,
+) -> str:
+    """Upload raw bytes into ComfyUI's input folder and return the filename."""
+    resp = await client.post(
+        f"{COMFY_HOST}/upload/image",
+        files={"image": (name, blob, content_type or "application/octet-stream")},
+        data={"overwrite": "true", "type": "input"},
+        timeout=300,
+    )
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ComfyUI rejected the upload: {resp.text[:300]}",
+        )
+    uploaded = resp.json()
+    return uploaded.get("name", name)
 
 
 @app.post("/v1/images/edits/upload")
@@ -2055,16 +2371,9 @@ async def image_edits_upload(
     staged_name = f"ref-{uuid.uuid4().hex[:12]}.{ext}"
 
     async with httpx.AsyncClient(timeout=300) as client:
-        upload = await client.post(
-            f"{COMFY_HOST}/upload/image",
-            files={"image": (staged_name, blob, image.content_type or "application/octet-stream")},
-            data={"overwrite": "true", "type": "input"},
+        staged_name = await stage_upload_to_comfy(
+            staged_name, blob, image.content_type, client
         )
-        if upload.status_code >= 400:
-            raise HTTPException(
-                status_code=502,
-                detail=f"ComfyUI rejected the upload: {upload.text[:300]}",
-            )
 
         mask_blob: Optional[bytes] = None
         if mask is not None:
@@ -2216,6 +2525,9 @@ async def chat_completions(req: ChatCompletionRequest):
             )
         actual_prompt = user_prompts[-1].strip()
 
+        # H3/Wan text encoders are English-only — translate CJK prompts first.
+        actual_prompt = await translate_prompt_to_english(actual_prompt)
+
         # Build the H3 / Wan workflow and submit it directly to ComfyUI.
         # This mirrors the dedicated /v1/video/generations path but keeps
         # the call in-process so we don't recurse through
@@ -2226,6 +2538,14 @@ async def chat_completions(req: ChatCompletionRequest):
         steps = req.steps or 4
         negative = req.negative_prompt or ""
         client_id = str(uuid.uuid4())
+
+        # Reference images ride along on the chat contract too, so an
+        # image-to-video request works over /v1/chat/completions as well.
+        staged_images: List[str] = []
+        if req.image_urls:
+            async with httpx.AsyncClient(timeout=300) as client:
+                staged_images = await stage_reference_images(req.image_urls, client)
+            actual_prompt = apply_reference_tags(actual_prompt, len(staged_images))
 
         if "wan" in model_id or "2.1" in model_id:
             log.warning(
@@ -2254,6 +2574,7 @@ async def chat_completions(req: ChatCompletionRequest):
             shift_video=req.shift_video,
             shift_audio=req.shift_audio,
             turbo_mode=req.turbo,
+            images=staged_images,
             filename_prefix="video/BeefTV",
         )
 
@@ -2457,6 +2778,7 @@ class _NewAPIVideoRequest(BaseModel):
     image_urls: List[str] = Field(default_factory=list)
     video_urls: List[str] = Field(default_factory=list)
     audio_urls: List[str] = Field(default_factory=list)
+    seed: Optional[int] = None
 
 
 def _extract_chat_video_url(payload: Any) -> Optional[str]:
@@ -2491,109 +2813,127 @@ def _extract_chat_video_url(payload: Any) -> Optional[str]:
     return None
 
 
+def aspect_ratio_to_size(aspect: str) -> tuple[int, int]:
+    """Map an aspect ratio onto the H3 canvas.
+
+    H3 was distilled at a 768 short edge with a 768x1344 pixel area cap, so
+    the requested ratio is fitted into that box and rounded to the 32-pixel
+    grid the model expects.
+    """
+    ratio = 16.0 / 9.0
+    raw = (aspect or "").strip().lower()
+    if ":" in raw:
+        try:
+            width_part, height_part = raw.split(":", 1)
+            height_value = float(height_part)
+            if height_value > 0:
+                ratio = float(width_part) / height_value
+        except (TypeError, ValueError):
+            ratio = 16.0 / 9.0
+    else:
+        match = re.match(r"^(\d+)\s*[x×]\s*(\d+)$", raw)
+        if match:
+            try:
+                height_value = float(match.group(2))
+                if height_value > 0:
+                    ratio = float(match.group(1)) / height_value
+            except (TypeError, ValueError):
+                ratio = 16.0 / 9.0
+    short_edge = 768.0
+    if ratio >= 1.0:
+        width = short_edge * ratio
+        height = short_edge
+    else:
+        width = short_edge
+        height = short_edge / ratio
+    max_area = 768.0 * 1344.0
+    if width * height > max_area:
+        scale = math.sqrt(max_area / (width * height))
+        width *= scale
+        height *= scale
+    return (
+        max(32, int(round(width / 32)) * 32),
+        max(32, int(round(height / 32)) * 32),
+    )
+
+
+def h3_length_frames(frames: int) -> int:
+    """Snap a frame count to the H3 17k+5 grid (5, 22, 39, …)."""
+    return max(17, ((max(17, frames) - 5) // 17) * 17 + 5)
+
+
+def apply_reference_tags(prompt: str, image_count: int) -> str:
+    """Add the ``<Picture i>`` markers the H3 reference node expects.
+
+    The ref2va conditioning reads reference images in request order and the
+    prompt has to point at them by ordinal. Without the tags the images still
+    condition the model, but nothing in the text refers to them.
+    """
+    if image_count < 3:
+        return prompt
+    missing = [
+        f"<Picture {index}>"
+        for index in range(1, image_count + 1)
+        if f"<Picture {index}>" not in prompt
+    ]
+    if not missing:
+        return prompt
+    return (prompt + " " + " ".join(missing)).strip()
+
+
 async def _submit_video_task(req: _NewAPIVideoRequest) -> str:
     """Submit a video job to ComfyUI and return the prompt_id immediately.
 
-    The WIP /v1/video/generations client expects the POST to return fast with
-    a task ID, then polls GET /v1/video/generations/{id} for status. This
-    helper submits the chat-completions streaming variant, reads just the
-    first SSE event (which carries the prompt_id), then returns. ComfyUI
-    keeps rendering in the background and the GET endpoint reads
-    /history/{id} to surface the result.
+    The job is built and submitted here instead of being routed through
+    ``chat_completions``: the NewAPI contract carries reference images
+    (``image_urls``) that the chat request has no field for, and the prompt
+    is needed as a ComfyUI graph, not as a chat message.
     """
     if not req.prompt.strip() and not req.image_urls:
         raise HTTPException(status_code=400, detail="prompt or image_urls is required")
 
-    prompt_text = req.prompt.strip() or " "
+    prompt_text = (await translate_prompt_to_english(req.prompt.strip())) or " "
 
-    log.info(
-        f"[newapi-shim] video generations model={req.model} "
-        f"seconds={req.seconds} aspect_ratio={req.aspect_ratio} "
-        f"images={len(req.image_urls)} videos={len(req.video_urls)} "
-        f"audios={len(req.audio_urls)}"
-    )
-
-    # Translate seconds → duration (frames) so the chat-completion path picks
-    # it up. The video path inside chat_completions snaps the value to the
-    # 17k+5 frame grid automatically.
     try:
         seconds_val = int(req.seconds) if req.seconds else 6
     except (TypeError, ValueError):
         seconds_val = 6
     duration_frames = seconds_val * 24  # H3 runs at 24fps
+    length = h3_length_frames(duration_frames)
+    width, height = aspect_ratio_to_size(req.aspect_ratio)
 
-    chat_request = ChatCompletionRequest(
-        model=req.model,
-        messages=[Message(role="user", content=prompt_text)],
-        stream=True,
-        duration=duration_frames,
+    async with httpx.AsyncClient(timeout=300) as client:
+        staged_images = await stage_reference_images(req.image_urls, client)
+
+    prompt_text = apply_reference_tags(prompt_text, len(staged_images))
+
+    log.info(
+        f"[newapi-shim] video generations model={req.model} "
+        f"seconds={req.seconds} aspect_ratio={req.aspect_ratio} "
+        f"size={width}x{height} frames={length} "
+        f"images={len(staged_images)}/{len(req.image_urls)}"
     )
 
-    response = await chat_completions(chat_request)
-    if not isinstance(response, StreamingResponse):
-        raise HTTPException(
-            status_code=502,
-            detail="Video submit did not return a streaming response",
-        )
+    model_id = (req.model or "").lower()
+    if "wan" in model_id or "2.1" in model_id:
+        log.warning("Wan 2.1 is not installed on the DGX — aliasing to minimax-h3")
+        model_id = "minimax-h3"
 
-    # Consume just enough of the SSE stream to grab the prompt_id. FastAPI's
-    # StreamingResponse may flush the body_iterator in arbitrary chunks, so
-    # we accumulate until we see at least one full "data: {...}\n\n" event,
-    # then break out and drain the rest in the background.
-    body_iter = response.body_iterator
-    buffer = ""
-    prompt_id: Optional[str] = None
-    try:
-        # Keep reading small chunks (up to ~4 KB) for up to 30s.
-        deadline = asyncio.get_event_loop().time() + 30
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                chunk = await asyncio.wait_for(anext(body_iter, None), timeout=2)
-            except (asyncio.TimeoutError, StopAsyncIteration):
-                break
-            if chunk is None:
-                break
-            text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
-            buffer += text
-            # A complete SSE event ends with "\n\n"; parse whatever we have.
-            for raw_line in buffer.splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if line.startswith("data:") or line.startswith("data "):
-                    payload = line.split(":", 1)[1].strip()
-                    try:
-                        obj = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    pid = obj.get("prompt_id")
-                    if pid:
-                        prompt_id = pid
-                        break
-            if prompt_id:
-                break
-    except Exception:
-        pass
+    workflow = build_minimax_h3_workflow(
+        prompt=prompt_text,
+        width=width,
+        height=height,
+        length_frames=length,
+        seed=req.seed if req.seed is not None else secrets.randbelow(1 << 31),
+        steps=4,
+        turbo_mode="4step",
+        images=staged_images,
+        filename_prefix="video/BeefTV",
+    )
 
-    # Drain the rest of the stream in the background so ComfyUI's SSE keepalive
-    # is consumed (otherwise uvicorn logs warnings about an unclosed generator).
-    async def _drain() -> None:
-        try:
-            async for _ in body_iter:
-                pass
-        except Exception:
-            pass
-
-    asyncio.create_task(_drain())
-
-    if not prompt_id:
-        log.error(
-            f"[newapi-shim] No prompt_id parsed from SSE; buffer={buffer[:300]!r}"
-        )
-        raise HTTPException(
-            status_code=502,
-            detail="Could not extract prompt_id from the SSE response",
-        )
+    client_id = str(uuid.uuid4())
+    prompt_id = await comfy_prompt(workflow, client_id)
+    log.info(f"[{prompt_id}] Submitted {model_id} job, client={client_id}")
     return prompt_id
 
 

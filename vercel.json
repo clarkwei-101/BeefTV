@@ -1,0 +1,33 @@
+{
+    "$schema": "https://openapi.vercel.sh/vercel.json",
+    "framework": null,
+    "installCommand": "cd web && bun install --frozen-lockfile",
+    "buildCommand": "cd web && bun run build",
+    "outputDirectory": "web/dist",
+    "routes": [
+        {
+            "src": "/api/(.*)",
+            "dest": "https://bogged-scoff-compare.ngrok-free.dev/api/$1",
+            "headers": {
+                "x-vercel-enable-rewrite-caching": "0"
+            },
+            "transforms": [
+                {
+                    "type": "request.headers",
+                    "op": "set",
+                    "target": {
+                        "key": "ngrok-skip-browser-warning"
+                    },
+                    "args": "1"
+                }
+            ]
+        },
+        {
+            "handle": "filesystem"
+        },
+        {
+            "src": "/(.*)",
+            "dest": "/index.html"
+        }
+    ]
+}

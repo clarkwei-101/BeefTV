@@ -1,4 +1,4 @@
-import { lazy, Suspense, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, type ReactNode } from "react";
 import { Navigate, Outlet, useLocation, useParams } from "react-router";
 
 import { createWorkspaceRouter } from "@/lib/app-routing";
@@ -7,6 +7,7 @@ import { loadAgentsPage, loadAssetsPage, loadCanvasPage, loadCanvasProjectPage, 
 import { CanvasRefreshShell } from "@/pages/canvas/canvas-refresh-shell";
 import RouteErrorPage from "@/pages/route-error";
 import { isLocalWorkspaceMode } from "@/services/workspace-mode";
+import { useSessionStore } from "@/stores/use-session-store";
 
 const AgentsPage = lazy(loadAgentsPage);
 const AssetsPage = lazy(loadAssetsPage);
@@ -21,6 +22,7 @@ const ProjectDetailPage = lazy(loadProjectDetailPage);
 const SettingsPage = lazy(() => import("@/pages/settings"));
 const TestVoiceRecording = lazy(() => import("@/pages/test-voice-recording"));
 const UserLayout = lazy(() => import("@/layouts/user-layout"));
+const AuthPage = lazy(() => import("@/pages/auth"));
 const RequireFeature = lazy(() => import("@/components/workspace/require-feature").then((module) => ({ default: module.RequireFeature })));
 
 function deferred(element: ReactNode) {
@@ -69,10 +71,36 @@ function devRoutes() {
     ];
 }
 
+function RequireSession({ children }: { children: ReactNode }) {
+    const status = useSessionStore((state) => state.status);
+    const account = useSessionStore((state) => state.account);
+    const profile = useSessionStore((state) => state.profile);
+    const needsSetup = useSessionStore((state) => state.needsSetup);
+    const ensureSession = useSessionStore((state) => state.ensureSession);
+    const { pathname } = useLocation();
+    useEffect(() => {
+        void ensureSession();
+    }, [ensureSession]);
+    useEffect(() => {
+        const onExpired = () => {
+            if (pathname !== "/login") window.location.assign("/login");
+        };
+        window.addEventListener("beeftv:auth-expired", onExpired);
+        return () => window.removeEventListener("beeftv:auth-expired", onExpired);
+    }, [pathname]);
+    if (status === "unknown") return <WorkspaceRouteLoader />;
+    // 桌面本机形态（Wails / localhost desktop 后端）：零登录体验，直接放行。
+    // 公网 server 形态才强制登录。
+    if (profile === "desktop") return <>{children}</>;
+    if (!account) return <Navigate to={needsSetup ? "/login?setup=1" : "/login"} replace />;
+    return <>{children}</>;
+}
+
 export const router = createWorkspaceRouter([
     ...(import.meta.env.DEV ? devRoutes() : []),
+    { path: "/login", element: <Suspense fallback={<WorkspaceRouteLoader />}>{<AuthPage />}</Suspense>, errorElement: <RouteErrorPage /> },
     {
-        element: <WorkspaceLayout />,
+        element: <RequireSession><WorkspaceLayout /></RequireSession>,
         errorElement: <RouteErrorPage />,
         children: [
             { path: "/", element: deferred(<HomePage />) },
