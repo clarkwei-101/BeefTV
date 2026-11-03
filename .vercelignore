@@ -1,0 +1,25 @@
+# Vercel 上传排除：本地数据、构建产物、依赖和模型权重都不进部署包。
+# 根目录必须是仓库根（web/vite.config.ts 读 ../VERSION 与 ../CHANGELOG.md，
+# web/src/lib/beefapi-video-contracts.ts 引 ../backend/.../video_contracts.json），
+# 所以这里只排除依赖与产物，不排除源码目录。
+
+node_modules
+web/node_modules
+agent-host/node_modules
+web/dist
+dist
+build
+backend/data
+backend/cmd/server/server
+backend/server
+.local
+.git
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+# 根目录的临时对比图（未纳入版本管理），web/public 下的资源必须保留。
+/tmp_*.png
+# 本地 ONNX 语音模型（152MB），不是部署产物。
+g2pW

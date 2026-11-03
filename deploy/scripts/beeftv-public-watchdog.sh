@@ -15,6 +15,7 @@
 #   BEEFTV_BACKEND_DATA=/tmp/beeftv-e2e-data
 #   BEEFTV_BACKEND_PORT=18080  BEEFTV_WEB_PORT=13001  BEEFTV_PROXY_PORT=8198
 #   BEEFTV_PROXY_TOKEN=E2E_SMOKE_TOKEN_0123456789abcdef
+#   BEEFTV_EXTRA_CORS_ORIGINS=https://beeftv-web.vercel.app
 set -u
 REPO_DIR="/Users/yahweh/Desktop/ai应用社/beeftv-web"
 cd "$REPO_DIR" || exit 1
@@ -24,6 +25,9 @@ BACKEND_PORT="${BEEFTV_BACKEND_PORT:-18080}"
 WEB_PORT="${BEEFTV_WEB_PORT:-13001}"
 PROXY_PORT="${BEEFTV_PROXY_PORT:-8198}"
 BEEFTV_PROXY_TOKEN="${BEEFTV_PROXY_TOKEN:-E2E_SMOKE_TOKEN_0123456789abcdef}"
+# Vercel 托管的前端是独立的源站，必须显式列入 CORS 白名单，否则后端会对
+# 带 Origin 的请求返回 403 "不允许的跨域来源"。
+BEEFTV_EXTRA_CORS_ORIGINS="${BEEFTV_EXTRA_CORS_ORIGINS:-https://beeftv-web.vercel.app,https://beeftv-web-clarkwei-101s-projects.vercel.app}"
 URL_FILE="/tmp/beeftv_public_url"
 TUNNEL_LOG="/tmp/beeftv-quick-tunnel-live.log"
 WATCHDOG_LOG="/tmp/beeftv-watchdog.log"
@@ -168,7 +172,7 @@ ensure_backend() {
       CANVAS_REGISTRATION_ENABLED=true \
       CANVAS_ALLOW_PRIVATE_UPSTREAMS=false \
       CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS="127.0.0.1,localhost,192.168.1.193" \
-      CANVAS_CORS_ORIGINS="http://127.0.0.1:3000,$(cat "$URL_FILE" 2>/dev/null)" \
+      CANVAS_CORS_ORIGINS="http://127.0.0.1:3000,$(cat "$URL_FILE" 2>/dev/null),${BEEFTV_EXTRA_CORS_ORIGINS:-}" \
       CANVAS_BACKEND_ADDR=":$BACKEND_PORT" \
       CANVAS_OFFICIAL_PLUGIN_DIR="$PLUGIN_DIR" \
       BEEFTV_PROXY_TOKEN="$BEEFTV_PROXY_TOKEN" \
