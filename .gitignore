@@ -97,3 +97,4 @@ tools/depth-capture/**/__pycache__/
 g2pW/
 tests/
 
+.vercel

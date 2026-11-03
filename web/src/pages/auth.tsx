@@ -28,16 +28,24 @@ export default function AuthPage() {
 
     async function handleSubmit(values: { username: string; password: string; confirm?: string }) {
         const username = values.username.trim();
-        if (mode === "register") {
-            if (values.password !== values.confirm) {
-                message.error("Two passwords do not match");
-                return;
+        // 注册/登录失败必须把后端原因显示出来：store 的 login/register 会抛，
+        // 这里不接住就会变成 unhandledrejection，页面毫无反馈，
+        // 用户只会看到「点了没反应」（用户名占用、注册关闭、后端不可达都一样）。
+        try {
+            if (mode === "register") {
+                if (values.password !== values.confirm) {
+                    message.error("Two passwords do not match");
+                    return;
+                }
+                await register(username, values.password);
+                message.success(`Welcome, ${username}`);
+            } else {
+                await login(username, values.password);
+                message.success(`Welcome back, ${username}`);
             }
-            await register(username, values.password);
-            message.success(`Welcome, ${username}`);
-        } else {
-            await login(username, values.password);
-            message.success(`Welcome back, ${username}`);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "操作失败，请稍后重试");
+            return;
         }
         navigate("/", { replace: true });
     }
