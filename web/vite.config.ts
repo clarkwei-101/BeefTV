@@ -2,7 +2,7 @@ import { dirname, resolve } from "node:path";
 import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 
 import { resolveHeavyMediaEnabled } from "./media-build-mode";
 
@@ -12,6 +12,13 @@ const appChangelog = readFileSync(resolve(webDir, "../CHANGELOG.md"), "utf8");
 const apiProxyTarget = process.env.VITE_API_PROXY_TARGET?.trim() || "http://127.0.0.1:8080";
 const desktopLaunchToken = process.env.VITE_DESKTOP_LAUNCH_TOKEN?.trim();
 const heavyMediaEnabled = resolveHeavyMediaEnabled(process.env.BEEFTV_FULL_MEDIA_RESOURCES);
+
+/**
+ * 每个构建产出一个唯一标记。客户端启动时用它对比部署在 CDN 上的标记，
+ * 判断自己手里这份 index.html 是不是旧版本 —— 旧版本引用的 chunk 已经被
+ * 新的部署删掉，动态 import 会直接失败。
+ */
+const buildStamp = process.env.VITE_BUILD_STAMP?.trim() || `b${Date.now().toString(36)}`;
 
 function pruneOptionalMediaPlugin() {
     return {
@@ -33,13 +40,32 @@ function pruneOptionalMediaPlugin() {
     };
 }
 
+function emitBuildStampPlugin(): Plugin {
+    return {
+        name: "beeftv-emit-build-stamp",
+        generateBundle() {
+            this.emitFile({
+                type: "asset",
+                fileName: "build-stamp.json",
+                source: JSON.stringify({ stamp: buildStamp, version: appVersion }),
+            });
+        },
+        // index.html 里有一段内联脚本需要在任何 module 之前做版本自愈，
+        // 那里拿不到 import.meta.env，所以构建时直接把标记写进去。
+        transformIndexHtml(html: string) {
+            return html.replace(/__BEEFTV_BUILD_STAMP__/g, buildStamp);
+        },
+    };
+}
+
 export default defineConfig({
-    plugins: [react(), pruneOptionalMediaPlugin()],
+    plugins: [react(), pruneOptionalMediaPlugin(), emitBuildStampPlugin()],
     define: {
         __APP_VERSION__: JSON.stringify(appVersion),
         __APP_CHANGELOG__: JSON.stringify(appChangelog),
         __BEEFTV_HEAVY_MEDIA_ENABLED__: JSON.stringify(heavyMediaEnabled),
         "import.meta.env.VITE_APP_VERSION": JSON.stringify(appVersion),
+        "import.meta.env.VITE_BUILD_STAMP": JSON.stringify(buildStamp),
     },
     server: {
         host: "0.0.0.0",

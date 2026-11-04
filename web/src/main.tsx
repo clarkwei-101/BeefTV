@@ -3,6 +3,7 @@ import "@fontsource-variable/jetbrains-mono";
 import { bootstrapAppearance } from "@/services/appearance-bootstrap";
 import { bootstrapDesktopRuntime } from "@/services/desktop-runtime";
 import { hydrateLocalCanvasProjectsFromBackend } from "@/services/local-workspace-repository";
+import { healStaleDeployment } from "@/services/stale-deployment-healer";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 
 /**
@@ -46,6 +47,10 @@ function reportBootstrapFailure(error: unknown) {
 }
 
 async function startApplication() {
+    // 先确认手上的 index.html 不是旧版本：旧版本会引用已经被删除的 chunk，
+    // 导致动态 import 失败。检测到版本过期就先强制重载，别再往下走。
+    if (await healStaleDeployment()) return;
+
     await bootstrapDesktopRuntime();
     // 浏览器缓存晚于后端读入完成时，会用旧连接数组盖掉刚合并的画布。
     await useCanvasStore.persist.rehydrate();

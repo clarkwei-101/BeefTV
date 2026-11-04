@@ -23,6 +23,30 @@
             ]
         },
         {
+            "src": "/build-stamp.json",
+            "dest": "/build-stamp.json",
+            "headers": {
+                "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+                "x-vercel-cache": "0"
+            }
+        },
+        {
+            "src": "/",
+            "dest": "/index.html",
+            "headers": {
+                "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+                "x-vercel-cache": "0"
+            }
+        },
+        {
+            "src": "/index.html",
+            "dest": "/index.html",
+            "headers": {
+                "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+                "x-vercel-cache": "0"
+            }
+        },
+        {
             "handle": "filesystem"
         },
         {
@@ -31,7 +55,10 @@
         },
         {
             "src": "/(.*)",
-            "dest": "/index.html"
+            "dest": "/index.html",
+            "headers": {
+                "cache-control": "no-store, no-cache, must-revalidate, max-age=0"
+            }
         }
     ]
 }

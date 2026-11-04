@@ -62,6 +62,63 @@
             document.documentElement.style.colorScheme = theme;
             document.documentElement.style.setProperty("--background", theme === "dark" ? "#0f0f0f" : "#f5f5f5");
         </script>
+        <script>
+            // 版本自愈：必须在任何 module 脚本之前执行。
+            //
+            // CDN 会缓存 index.html，用户手上可能是一份旧版本：它引用的 chunk
+            // 在新部署里已经被删除，于是动态 import 报
+            //「Importing a module script failed.」，页面永远卡在加载态。
+            //
+            // 这里做两件事：
+            //   1. 捕获 module 脚本加载失败（入口 chunk 404）→ 强制重载一次；
+            //   2. 用构建标记对比服务器上的当前部署 → 版本过期就重载。
+            // 只允许重载一次，避免刷新死循环。
+            (function () {
+                var LOCAL = "__BEEFTV_BUILD_STAMP__";
+                var FLAG = "beeftv:stale-reload";
+                var PLACEHOLDER = "__BEEFTV_";
+
+                function reloadOnce() {
+                    try {
+                        if (Number(sessionStorage.getItem(FLAG) || "0") >= 1) return false;
+                        sessionStorage.setItem(FLAG, "1");
+                    } catch (error) {
+                        return false;
+                    }
+                    var url = new URL(location.href);
+                    url.searchParams.set("_r", Date.now().toString(36));
+                    location.replace(url.toString());
+                    return true;
+                }
+
+                // 1. 资源加载失败不冒泡，但在捕获阶段能收到。
+                window.addEventListener(
+                    "error",
+                    function (event) {
+                        var el = event.target;
+                        if (!el || el.tagName !== "SCRIPT") return;
+                        var src = el.src || "";
+                        if (/\.js(\?|$)/.test(src)) reloadOnce();
+                    },
+                    true
+                );
+
+                // 2. 构建标记对比。dev 下保留占位符，直接跳过。
+                if (LOCAL && LOCAL.indexOf(PLACEHOLDER) !== 0) {
+                    fetch("/build-stamp.json?_=" + Date.now(), {
+                        cache: "no-store",
+                        credentials: "same-origin",
+                    })
+                        .then(function (response) {
+                            return response.ok ? response.json() : null;
+                        })
+                        .then(function (payload) {
+                            if (payload && payload.stamp && payload.stamp !== LOCAL) reloadOnce();
+                        })
+                        .catch(function () {});
+                }
+            })();
+        </script>
     </head>
     <body class="bg-background text-foreground antialiased">
         <div id="root"></div>
