@@ -18,9 +18,18 @@
 #   BEEFTV_EXTRA_CORS_ORIGINS=https://beeftv-web.vercel.app
 set -u
 REPO_DIR="/Users/yahweh/Desktop/ai应用社/beeftv-web"
-cd "$REPO_DIR" || exit 1
+# 工作目录绝不能放在 ~/Desktop 下。
+# launchd 起的进程受 TCC 限制，枚举 ~/Desktop 会**永久挂起**（不是报错）：
+# Python 启动时会把 cwd 放进 sys.path，import 任意第三方模块都要扫描这个目录，
+# 于是 `python -c "import fastapi"` 直接卡死，watchdog 只能打印"候选解释器不可用"。
+# 所以这里退到 HOME，所有运行时操作都在 ~/.local/share/beeftv 下进行。
+cd "$HOME" || exit 1
 
-BACKEND_DATA="${BEEFTV_BACKEND_DATA:-/tmp/beeftv-e2e-data}"
+# 数据目录不能放在 /tmp：macOS 会定期清理 /tmp，之前 SQLite 库被清掉后
+# 所有账户消失，接口全部 401，前端表现为"永远卡在加载页"。
+# 现在固定放在 ~/.local/share/beeftv/data 下。
+LEGACY_BACKEND_DATA="/tmp/beeftv-e2e-data"
+BACKEND_DATA="${BEEFTV_BACKEND_DATA:-$HOME/.local/share/beeftv/data}"
 BACKEND_PORT="${BEEFTV_BACKEND_PORT:-18080}"
 WEB_PORT="${BEEFTV_WEB_PORT:-13001}"
 PROXY_PORT="${BEEFTV_PROXY_PORT:-8198}"
@@ -33,7 +42,12 @@ TUNNEL_LOG="/tmp/beeftv-quick-tunnel-live.log"
 WATCHDOG_LOG="/tmp/beeftv-watchdog.log"
 BACKEND_LOG="/tmp/beeftv-backend-watchdog.log"
 PROXY_LOG="/tmp/beeftv-proxy-watchdog.log"
-SERVER_BIN="/tmp/beeftv-server"
+SERVER_BIN="${BEEFTV_SERVER_BIN:-$HOME/.local/share/beeftv/beeftv-server}"
+# 后端二进制不能放在 /tmp：macOS 会定期清理 /tmp，之前二进制被清掉后
+# watchdog 想重建却读不到 ~/Desktop 下的仓库（launchd 进程受 TCC 限制），
+# 于是后端再也没起来过 —— 整站 API 全 404，而前端只表现为"卡在加载页"。
+# 现在二进制固定放在 ~/.local/share/beeftv 下，仓库读不到时继续用旧副本。
+LEGACY_SERVER_BIN="/tmp/beeftv-server"
 CLOUDFLARED="${CLOUDFLARED:-/opt/homebrew/bin/cloudflared}"
 METRICS_ADDR="127.0.0.1:20244"
 # launchd 起的进程受 TCC 限制，读不到 ~/Desktop 下的仓库文件（Python 报
@@ -55,7 +69,40 @@ LOCK_DIR="/tmp/beeftv-watchdog.lock"
 # 日志上限：超过这个大小就裁剪，只保留尾部。
 MAX_LOG_BYTES=$((20 * 1024 * 1024))
 
-log() { echo "[$(date '+%m-%d %H:%M:%S')] $*"; }
+log() { echo "[$(date '+%m-%d %H:%M:%S')] $*" >&2; }
+
+# ─── 受限仓库访问 ───
+# launchd 起的进程受 macOS TCC 限制，读 ~/Desktop 下的仓库文件时不会返回
+# 错误，而是**直接挂起**（Go 的 open() 曾经就这样卡死后端启动）。
+# 而且挂起发生在内核的文件系统层，SIGALRM 也打断不了 —— 用 alarm 包一层
+# 并不可靠。
+#
+# 因此这里的策略是：launchd 上下文里**根本不碰仓库**，一律使用
+# ~/.local/share/beeftv 下的运行副本。仓库更新由开发环境手动同步
+# （scripts/sync-beeftv-runtime.sh），watchdog 只负责保证副本可用。
+#
+# 需要在开发环境同步时，设置 BEEFTV_ALLOW_REPO_SYNC=1 打开这条路径。
+REPO_READ_TIMEOUT="${REPO_READ_TIMEOUT:-8}"
+ALLOW_REPO_SYNC="${BEEFTV_ALLOW_REPO_SYNC:-0}"
+
+# repo_read <命令...>：执行一条会访问仓库的命令。
+# 默认直接拒绝（TCC 下访问仓库会挂起，alarm 也救不回来）；
+# 只有显式打开 BEEFTV_ALLOW_REPO_SYNC 时才真的执行，并套上超时保护。
+repo_read() {
+  if [ "$ALLOW_REPO_SYNC" != "1" ]; then
+    return 1
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$REPO_READ_TIMEOUT" "$@" 2>/dev/null
+  else
+    "$@" 2>/dev/null
+  fi
+}
+
+# repo_read_file <路径>：读一个仓库文件到标准输出，失败返回非 0。
+repo_read_file() {
+  repo_read cat "$1"
+}
 
 port_listen() { lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; }
 
@@ -127,11 +174,12 @@ lock_owned_by_self() {
 # 返回 2，表示"无法判断"，调用方要按"未知"处理而不是当成陈旧。
 backend_source_newer() {
   [ -x "$SERVER_BIN" ] || return 1
+  # launchd 上下文访问 ~/Desktop 会挂起，默认不做这个检查。
+  [ "$ALLOW_REPO_SYNC" = "1" ] || return 2
   local newer
-  newer=$(find "$REPO_DIR/backend" -name '*.go' -newer "$SERVER_BIN" -print -quit 2>/dev/null)
+  newer=$(repo_read find "$REPO_DIR/backend" -name '*.go' -newer "$SERVER_BIN" -print -quit)
   if [ -z "$newer" ]; then
-    # find 读不到目录时和"没有更新"无法区分，用 stat 复核一次。
-    if ! stat "$REPO_DIR/backend" >/dev/null 2>&1; then
+    if ! repo_read stat "$REPO_DIR/backend" >/dev/null 2>&1; then
       return 2
     fi
     return 1
@@ -142,16 +190,33 @@ backend_source_newer() {
 ensure_backend() {
   if port_listen "$BACKEND_PORT"; then return 0; fi
   log "backend :$BACKEND_PORT DOWN → 重启中…"
+
+  # 旧版本把二进制放在 /tmp，macOS 清理后就没了。这里做一次迁移，
+  # 避免升级后第一次重启还要重新编译 48MB 的二进制。
+  if [ ! -x "$SERVER_BIN" ] && [ -x "$LEGACY_SERVER_BIN" ]; then
+    cp -f "$LEGACY_SERVER_BIN" "$SERVER_BIN" 2>/dev/null && chmod +x "$SERVER_BIN" \
+      && log "后端二进制已从 $LEGACY_SERVER_BIN 迁移到 $SERVER_BIN"
+  fi
+
   if [ ! -x "$SERVER_BIN" ]; then
-    # launchd 进程读不到 ~/Desktop 下的仓库，go build 会失败；失败时给出可执行的提示。
-    # launchd 给的 PATH 只有系统目录，Homebrew 的 go 不在其中——不补 PATH 时
-    # `go build` 永远报 "go: command not found"，后端就再也起不来了。
-    if (cd backend && PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" go build -o "$SERVER_BIN" ./cmd/server) >>"$BACKEND_LOG" 2>&1; then
+    # launchd 上下文访问 ~/Desktop 下的仓库会挂起，不能在这里现场编译。
+    # 二进制必须在开发环境构建好并放到 ~/.local/share/beeftv/beeftv-server。
+    # 仅当显式打开仓库访问时才尝试现场构建。
+    if [ "$ALLOW_REPO_SYNC" = "1" ] \
+       && repo_read env -C "$REPO_DIR/backend" PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+         go build -o "$SERVER_BIN" ./cmd/server >>"$BACKEND_LOG" 2>&1; then
       log "backend 已构建 → $SERVER_BIN"
     else
-      log "backend 构建失败（launchd 可能读不到仓库）；请在普通终端执行：cd $REPO_DIR/backend && go build -o $SERVER_BIN ./cmd/server"
+      log "backend 二进制缺失且无法现场构建；请在普通终端执行：cd $REPO_DIR/backend && go build -o $SERVER_BIN ./cmd/server"
       return 1
     fi
+  fi
+  # 旧版本把数据目录放在 /tmp，macOS 清理后账户全丢。这里做一次迁移：
+  # 旧目录里还有库就搬过来，避免升级后所有用户被当成未注册。
+  if [ ! -f "$BACKEND_DATA/open_ai_canvas.db" ] && [ -f "$LEGACY_BACKEND_DATA/open_ai_canvas.db" ]; then
+    mkdir -p "$BACKEND_DATA" 2>/dev/null || true
+    cp -R "$LEGACY_BACKEND_DATA/." "$BACKEND_DATA/" 2>/dev/null \
+      && log "数据目录已从 $LEGACY_BACKEND_DATA 迁移到 $BACKEND_DATA"
   fi
   mkdir -p "$BACKEND_DATA"
   if ! sync_plugin_packages; then
@@ -176,7 +241,7 @@ ensure_backend() {
       CANVAS_BACKEND_ADDR=":$BACKEND_PORT" \
       CANVAS_OFFICIAL_PLUGIN_DIR="$PLUGIN_DIR" \
       BEEFTV_PROXY_TOKEN="$BEEFTV_PROXY_TOKEN" \
-      nohup "$SERVER_BIN" >>"$BACKEND_LOG" 2>&1
+      nohup "$SERVER_BIN" >>"$BACKEND_LOG" 2>&1 </dev/null
   ) &
   # launchd 上下文里后端冷启动实测约 35 秒（要扫数据目录、迁移旧数据、打开 SQLite WAL），
   # 30 秒的窗口会误报"重启失败"。窗口放宽到 60 秒，避免日志里出现假的失败。
@@ -188,16 +253,21 @@ ensure_backend() {
   tail -5 "$BACKEND_LOG" 2>/dev/null
   return 1
 }
-
 # sync_plugin_packages 把官方插件包从仓库复制到 ~/.local 下的运行目录。
 # launchd 进程读不到 ~/Desktop 时复制会失败；此时沿用已有副本，
 # 只有连已有副本都没有才算失败（后端启动必须有插件目录）。
 sync_plugin_packages() {
   mkdir -p "$PLUGIN_DIR" 2>/dev/null || return 1
-  if ! ls "$PLUGIN_DIR"/*.beeftv-plugin >/dev/null 2>&1; then
-    cp -R "$REPO_DIR/plugin-packages/." "$PLUGIN_DIR/" 2>/dev/null || return 1
-    log "官方插件包已同步到 $PLUGIN_DIR"
+  # 运行副本已存在就直接用：launchd 上下文访问 ~/Desktop 下的仓库会挂起。
+  if ls "$PLUGIN_DIR"/*.beeftv-plugin >/dev/null 2>&1; then
+    if [ "$ALLOW_REPO_SYNC" = "1" ]; then
+      repo_read cp -R "$REPO_DIR/plugin-packages/." "$PLUGIN_DIR/" 2>/dev/null || true
+    fi
+    return 0
   fi
+  # 运行副本缺失时才需要从仓库复制。
+  repo_read cp -R "$REPO_DIR/plugin-packages/." "$PLUGIN_DIR/" 2>/dev/null || return 1
+  log "官方插件包已同步到 $PLUGIN_DIR"
   ls "$PLUGIN_DIR"/*.beeftv-plugin >/dev/null 2>&1
 }
 
@@ -206,16 +276,21 @@ sync_plugin_packages() {
 # 所以直接跑仓库路径会报 "Operation not permitted"。
 sync_proxy_script() {
   mkdir -p "$RUNTIME_DIR" 2>/dev/null || return 1
-  if [ ! -f "$PROXY_SCRIPT" ]; then
-    cp -f "$REPO_DIR/beeftv_proxy.py" "$PROXY_SCRIPT" 2>/dev/null || return 1
+  # 运行副本已存在就直接用它：launchd 上下文访问 ~/Desktop 下的仓库会挂起，
+  # 不能让"同步"这一步阻塞整个 watchdog。
+  if [ -f "$PROXY_SCRIPT" ]; then
+    if [ "$ALLOW_REPO_SYNC" = "1" ]; then
+      # 只在内容不同时复制，避免每次重启都改 mtime。
+      if ! repo_read cmp -s "$REPO_DIR/beeftv_proxy.py" "$PROXY_SCRIPT"; then
+        repo_read cp -f "$REPO_DIR/beeftv_proxy.py" "$PROXY_SCRIPT" 2>/dev/null \
+          || { log "代理脚本同步失败（沿用旧副本）"; return 0; }
+        log "代理脚本已同步到 $PROXY_SCRIPT"
+      fi
+    fi
     return 0
   fi
-  # 只在内容不同时复制，避免每次重启都改 mtime。
-  if ! cmp -s "$REPO_DIR/beeftv_proxy.py" "$PROXY_SCRIPT" 2>/dev/null; then
-    cp -f "$REPO_DIR/beeftv_proxy.py" "$PROXY_SCRIPT" 2>/dev/null \
-      || { log "代理脚本同步失败（沿用旧副本）"; return 1; }
-    log "代理脚本已同步到 $PROXY_SCRIPT"
-  fi
+  # 运行副本缺失时才需要从仓库复制。
+  repo_read cp -f "$REPO_DIR/beeftv_proxy.py" "$PROXY_SCRIPT" 2>/dev/null || return 1
   return 0
 }
 
@@ -226,21 +301,43 @@ sync_proxy_script() {
 # 问题，而且实测带 fastapi/uvicorn。
 pick_proxy_python() {
   local candidate
-  for candidate in "${BEEFTV_PROXY_PYTHON:-}" "$HOME/.local/bin/python3" "/usr/local/bin/python3" "/opt/homebrew/bin/python3" "$REPO_DIR/.venv/bin/python3"; do
-    [ -n "$candidate" ] || continue
-    [ -x "$candidate" ] || continue
-    if "$candidate" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
-      echo "$candidate"
-      return 0
+  # 注意：解释器自检必须在**安全目录**下执行。
+  # Python 启动时会把 cwd 放进 sys.path，import 任意第三方包都要扫描该目录；
+  # launchd 进程在 ~/Desktop 下时这个扫描会永久挂起（macOS TCC），
+  # 表现为"候选解释器不可用"，实际是卡死。
+  # 这里用子 shell 把 cwd 钉在 RUNTIME_DIR，避免污染主流程。
+  local py
+  py=$(
+    cd "$RUNTIME_DIR" 2>/dev/null || exit 1
+    for candidate in "${BEEFTV_PROXY_PYTHON:-}" "$HOME/.local/bin/python3" "/usr/local/bin/python3" "/opt/homebrew/bin/python3"; do
+      [ -n "$candidate" ] || continue
+      [ -x "$candidate" ] || continue
+      if "$candidate" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+        echo "$candidate"
+        exit 0
+      fi
+      echo "  候选解释器不可用：$candidate" >&2
+    done
+    # 仓库里的 .venv 位于 ~/Desktop 下，launchd 进程执行它会挂起 ——
+    # 只有显式打开仓库访问时才试它，而且必须带超时保护。
+    if [ "$ALLOW_REPO_SYNC" = "1" ] && repo_read test -x "$REPO_DIR/.venv/bin/python3"; then
+      if repo_read "$REPO_DIR/.venv/bin/python3" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+        echo "$REPO_DIR/.venv/bin/python3"
+        exit 0
+      fi
     fi
-  done
-  local fallback
-  fallback=$(command -v python3 2>/dev/null || echo "")
-  if [ -n "$fallback" ] && "$fallback" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
-    echo "$fallback"
-    return 0
-  fi
-  return 1
+    local fallback
+    fallback=$(command -v python3 2>/dev/null || echo "")
+    if [ -n "$fallback" ] && "$fallback" -c "import fastapi, uvicorn" >/dev/null 2>&1; then
+      echo "$fallback"
+      exit 0
+    fi
+    echo "  兜底解释器也不可用：${fallback:-无}" >&2
+    exit 1
+  ) || true
+  [ -n "$py" ] || return 1
+  echo "$py"
+  return 0
 }
 
 ensure_proxy() {
@@ -258,15 +355,17 @@ ensure_proxy() {
     return 1
   fi
   cd "$RUNTIME_DIR" || return 1
+  # 解释器自检必须在一个安全目录里跑：Python 会把 cwd 放进 sys.path，
+  # cwd 在 ~/Desktop 下时 launchd 进程 import 会挂死。
   # launchd 给的 PATH 只有系统目录，Homebrew 的 ffmpeg/ffprobe 不在其中；
   # 代理内部也会自己兜底，但这里补上 PATH 能让所有外部工具都能被找到。
   PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
   BEEFTV_PROXY_LISTEN=0.0.0.0 \
   BEEFTV_PROXY_PORT="$PROXY_PORT" \
   BEEFTV_PROXY_TOKEN="$BEEFTV_PROXY_TOKEN" \
-  nohup "$py" "$PROXY_SCRIPT" >>"$PROXY_LOG" 2>&1 &
-  cd "$REPO_DIR" || true
-  for _ in $(seq 1 8); do
+    nohup "$py" "$PROXY_SCRIPT" >>"$PROXY_LOG" 2>&1 </dev/null &
+  # 不回到仓库目录：留在 RUNTIME_DIR，避免后续步骤把 ~/Desktop 传给出生的进程。
+  for _ in $(seq 1 15); do
     sleep 2
     curl -sf --max-time 3 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 \
       && { log "proxy 已恢复 :$PROXY_PORT (python=$py)"; return 0; }
@@ -301,18 +400,17 @@ resolve_mime_types() {
 # 避免只复制了一半就换掉线上可用的构建产物。
 stage_web_build() {
   mkdir -p "$RUNTIME_DIR" "$NGINX_DIR" "$NGINX_LOG_DIR" "$NGINX_RUN_DIR" 2>/dev/null || return 1
-  if [ ! -d "$REPO_DIR/web/dist" ]; then
-    # 仓库读不到（launchd TCC）：沿用已构建的副本。
-    [ -f "$WEB_ROOT/index.html" ]
-    return $?
-  fi
+  # launchd 上下文不能访问 ~/Desktop 下的仓库（TCC 会挂起访问），
+  # 所以默认只用已经构建好的运行副本；仓库同步由开发环境手动执行。
   local staging="$RUNTIME_DIR/web.new"
   rm -rf "$staging" 2>/dev/null || true
   mkdir -p "$staging" 2>/dev/null || return 1
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a "$REPO_DIR/web/dist/" "$staging/" >/dev/null 2>&1 || true
-  else
-    cp -R "$REPO_DIR/web/dist/." "$staging/" >/dev/null 2>&1 || true
+  if [ "$ALLOW_REPO_SYNC" = "1" ] && repo_read test -d "$REPO_DIR/web/dist"; then
+    if command -v rsync >/dev/null 2>&1; then
+      repo_read rsync -a "$REPO_DIR/web/dist/" "$staging/" >/dev/null 2>&1 || true
+    else
+      repo_read cp -R "$REPO_DIR/web/dist/." "$staging/" >/dev/null 2>&1 || true
+    fi
   fi
   if [ -f "$staging/index.html" ]; then
     rm -rf "$WEB_ROOT" 2>/dev/null || true
@@ -329,11 +427,12 @@ stage_web_build() {
 render_nginx_conf() {
   local src="$REPO_DIR/deploy/scripts/nginx-public.conf"
   mkdir -p "$NGINX_DIR" "$NGINX_LOG_DIR" "$NGINX_RUN_DIR" 2>/dev/null || return 1
-  if [ -f "$src" ]; then
+  # 模板在 ~/Desktop 下，launchd 上下文读它会挂起 —— 默认沿用已渲染的配置。
+  if [ "$ALLOW_REPO_SYNC" = "1" ] && repo_read test -f "$src"; then
     local mime
     mime=$(resolve_mime_types || true)
     if [ -n "$mime" ]; then
-      sed -e "s|__LISTEN_PORT__|$WEB_PORT|g" \
+      repo_read sed -e "s|__LISTEN_PORT__|$WEB_PORT|g" \
           -e "s|__WEB_ROOT__|$WEB_ROOT|g" \
           -e "s|__BACKEND_HOST__|127.0.0.1|g" \
           -e "s|__BACKEND_PORT__|$BACKEND_PORT|g" \
@@ -364,7 +463,7 @@ ensure_web() {
     "$NGINX_BIN" -c "$NGINX_CONF" -p "$NGINX_DIR" -t 2>&1 | tail -3
   fi
   # 2) 回退到仓库里的 vite 开发服务器（需要有 Desktop 访问权限的终端环境）。
-  if [ -d "$REPO_DIR/web/node_modules" ]; then
+  if [ "$ALLOW_REPO_SYNC" = "1" ] && repo_read test -d "$REPO_DIR/web/node_modules"; then
     # 同样用 exec 收尾，避免辅助子 shell 继承脚本 argv。
     (
       cd "$REPO_DIR/web" || exit 1
@@ -446,7 +545,7 @@ ensure_tunnel() {
       if [ -n "$old_url" ] && [ "$url" != "$old_url" ]; then
         # 隧道地址轮换：后端 CORS 白名单里还是旧地址，重启后端载入新地址。
         log "公网地址变化 ($old_url → $url)，重启后端更新 CORS…"
-        pkill -f "/tmp/beeftv-server" 2>/dev/null || true
+        pkill -f "$SERVER_BIN" 2>/dev/null || true
         sleep 2
         ensure_backend || true
       fi
@@ -487,13 +586,13 @@ while true; do
   case $? in
     0)
       if [ "$stale_warned" -eq 0 ]; then
-        log "后端二进制已过期（源码比 $SERVER_BIN 新），当前仍在跑旧版本；请在普通终端重建：cd $REPO_DIR/backend && go build -o $SERVER_BIN ./cmd/server && pkill -f /tmp/beeftv-server"
+        log "后端二进制已过期（源码比 $SERVER_BIN 新），当前仍在跑旧版本；请在普通终端重建：cd $REPO_DIR/backend && go build -o $SERVER_BIN ./cmd/server && pkill -f $SERVER_BIN"
         stale_warned=1
       fi
       ;;
   esac
-  ensure_backend || true
   ensure_proxy || true
+  ensure_backend || true
   ensure_web || true
   if ensure_tunnel; then
     sleep 20
