@@ -435,6 +435,13 @@ func resolveLocalModelSelection(logicalModelID string, input map[string]any, tas
 		// Ollama on Mac Studio for local text (qwen3:8b，移除 DS4 后接管全部文本)
 		baseURL = localProxyBaseURL()
 		apiFormat = "openai"
+	case "dgx-deepseek-local":
+		// DeepSeek V4 Flash on DGX Spark, long-context text.
+		// 之前漏了这个渠道：它落到下面的 default 分支返回 false，任务就退回
+		// 系统渠道解析，而本地渠道是 user scope、channelId 为空，后端直接返回
+		// "必须指定系统渠道和模型"，DeepSeek 在界面上选不中。
+		baseURL = localProxyBaseURL()
+		apiFormat = "openai"
 	case "mac-piper-local":
 		// Piper TTS on Mac Studio for local audio
 		baseURL = localProxyBaseURL()

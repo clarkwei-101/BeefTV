@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,11 +58,17 @@ func newID() string {
 		strings.ReplaceAll(randomString(8), "-", ""))
 }
 
+// randomString 生成 n 位随机字母数字串。
+//
+// 旧实现用 time.Now().UnixNano()%62 取字符，但循环体里没有推进时钟，
+// 同一纳秒内多次调用会得到完全相同的字符串，于是连续插入的记录生成了
+// 相同 ID，触发 UNIQUE constraint failed: model_channels.id 而整批回滚。
+// 这里改用 math/rand 并显式播种，ID 才有足够的区分度。
 func randomString(n int) string {
 	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
+		b[i] = letters[rand.Intn(len(letters))]
 	}
 	return string(b)
 }
@@ -74,6 +81,10 @@ func boolVal(b *bool) bool {
 }
 
 func main() {
+	// 播种随机数源：math/rand 默认是确定性的，同一进程内每次运行会生成
+	// 完全相同的 ID 序列。
+	rand.Seed(time.Now().UnixNano())
+
 	// Resolve paths
 	backendDir := "backend"
 	dataDir := filepath.Join(backendDir, "data")
@@ -181,7 +192,11 @@ func main() {
 		}
 
 		// Insert channel
-		channelID := newID()
+		//
+		// 渠道 ID 必须沿用 local-model-config.json 里的稳定 id（如 minimax-h3-local），
+		// 不能用随机 ULID：用户配置（imageModel/videoModel/...）引用的是这些稳定 id，
+		// 随机 ID 会让引用解析不到，接口直接返回"必须指定系统渠道和模型"。
+		channelID := ch.ID
 		modelsJSON := "[]"
 		if len(ch.Models) > 0 {
 			b, _ := json.Marshal(ch.Models)
@@ -191,12 +206,12 @@ func main() {
 		_, err := tx.Exec(`INSERT INTO model_channels
 			(id, user_id, scope, enabled, name, public_alias, sort_order, base_url, api_key, secret_key, api_format, concurrency_limit, models_json, retired_models_json, headers_json, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			channelID, "", scope, 1, ch.Name, "", ch.SortOrder, ch.BaseURL, ch.APIKey, ch.SecretKey, ch.APIFormat, 0, modelsJSON, "[]", "[]", now, now)
+			channelID, "", scope, 1, ch.Name, ch.ID, ch.SortOrder, ch.BaseURL, ch.APIKey, ch.SecretKey, ch.APIFormat, 0, modelsJSON, "[]", "[]", now, now)
 		if err != nil {
 			tx.Rollback()
 			log.Fatalf("插入渠道 %s (%s) 失败: %v", ch.Name, ch.ID, err)
 		}
-		log.Printf("  插入渠道: %s (base_url=%s)", ch.Name, ch.BaseURL)
+		log.Printf("  插入渠道: %s (id=%s base_url=%s)", ch.Name, channelID, ch.BaseURL)
 
 		// Insert models
 		for i, modelName := range ch.Models {
