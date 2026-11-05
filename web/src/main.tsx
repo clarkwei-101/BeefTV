@@ -14,7 +14,7 @@ import "./styles/beeftv-local-overrides.css";
 import { bootstrapAppearance } from "@/services/appearance-bootstrap";
 import { bootstrapDesktopRuntime } from "@/services/desktop-runtime";
 import { hydrateLocalCanvasProjectsFromBackend } from "@/services/local-workspace-repository";
-import { healStaleDeployment } from "@/services/stale-deployment-healer";
+import { healStaleDeployment, watchChunkLoadFailures } from "@/services/stale-deployment-healer";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 
 /**
@@ -91,6 +91,10 @@ async function startApplication() {
     // 先确认手上的 index.html 不是旧版本：旧版本会引用已经被删除的 chunk，
     // 导致动态 import 失败。检测到版本过期就先强制重载，别再往下走。
     if (await healStaleDeployment()) return;
+
+    // 兜底：站点已经打开后再发版时，旧 chunk 会被删除，后续动态 import
+    // 会 404。组件内的 import 不会落到路由错误页，只能在这里全局监听。
+    watchChunkLoadFailures();
 
     await bootstrapDesktopRuntime();
     // 浏览器缓存晚于后端读入完成时，会用旧连接数组盖掉刚合并的画布。

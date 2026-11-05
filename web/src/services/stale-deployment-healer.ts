@@ -69,3 +69,56 @@ export async function healStaleDeployment(): Promise<boolean> {
         window.clearTimeout(timer);
     }
 }
+
+/**
+ * 全局监听「chunk 加载失败」并自动整页重载。
+ *
+ * 场景：站点已经打开（跑的是旧部署的 JS），中途发版。旧 chunk 文件名被删除，
+ * 之后再触发任何动态 import 都会 404：
+ *   - 路由级 import → 落到路由错误页（那里已经单独处理）
+ *   - 组件内的 import → 变成未捕获的 rejection 或 window error 事件，
+ *     用户只会看到「界面卡住」或者某个功能点不响应，没有任何提示。
+ *
+ * 这里统一兜底：识别到 chunk 加载失败就整页重载一次，拿到新部署的
+ * index.html 和 chunk 映射，页面自动恢复。用 sessionStorage 计数防止死循环。
+ */
+const CHUNK_RELOAD_FLAG = "beeftv:chunk-reload";
+const MAX_CHUNK_RELOADS = 2;
+
+function isChunkLoadFailure(message: string): boolean {
+    return (
+        message.includes("Failed to fetch dynamically imported module") ||
+        message.includes("Importing a module script failed") ||
+        message.includes("error loading dynamically imported module") ||
+        message.includes("Failed to load module script")
+    );
+}
+
+function reloadForNewDeployment(): void {
+    try {
+        const reloads = Number(sessionStorage.getItem(CHUNK_RELOAD_FLAG) || "0");
+        if (reloads >= MAX_CHUNK_RELOADS) return;
+        sessionStorage.setItem(CHUNK_RELOAD_FLAG, String(reloads + 1));
+    } catch {
+        // sessionStorage 不可用时也允许重载一次。
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("_r", Date.now().toString(36));
+    window.location.replace(url.toString());
+}
+
+/** 安装 chunk 加载失败的全局兜底自愈。 */
+export function watchChunkLoadFailures(): void {
+    if (typeof window === "undefined") return;
+    window.addEventListener("error", (event) => {
+        const message = event.message || "";
+        if (!isChunkLoadFailure(message)) return;
+        reloadForNewDeployment();
+    });
+    window.addEventListener("unhandledrejection", (event) => {
+        const reason = event.reason;
+        const message = reason instanceof Error ? reason.message : String(reason || "");
+        if (!isChunkLoadFailure(message)) return;
+        reloadForNewDeployment();
+    });
+}
